@@ -1,0 +1,23 @@
+node_modules/
+dist/
+.next/
+*.tsbuildinfo
+
+# Never commit these. .env.example is the committed template.
+.env
+.env.local
+*.pem
+*.key
+keypair*.json
+id.json
+
+# Your own tracked wallets stay local. kol-wallets.example.json is the
+# committed template — import your own roster into kol-wallets.json.
+config/kol-wallets.json
+
+recordings/
+*.log
+
+.DS_Store
+
+CLAUDE.md
