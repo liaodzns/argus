@@ -23,14 +23,12 @@ export const EnvSchema = z
     // Solana data
     HELIUS_API_KEY: z.preprocess(blankToUndefined, z.string().min(1).optional()),
     LASERSTREAM_ENDPOINT: z.preprocess(blankToUndefined, z.string().url().optional()),
+    /** Left blank, both are derived from HELIUS_API_KEY below. */
     SOLANA_RPC_URL: z.preprocess(blankToUndefined, z.string().url().optional()),
+    SOLANA_WS_URL: z.preprocess(blankToUndefined, z.string().url().optional()),
     INGEST_SOURCE: z.preprocess(
       blankToUndefined,
-      z.enum(["laserstream", "pumpportal"]).default("pumpportal"),
-    ),
-    PUMPPORTAL_WS_URL: z.preprocess(
-      blankToUndefined,
-      z.string().url().default("wss://pumpportal.fun/api/data"),
+      z.enum(["laserstream", "helius_logs"]).default("helius_logs"),
     ),
 
     // Enrichment
@@ -55,19 +53,29 @@ export const EnvSchema = z
     ARGUS_CONFIG_DIR: z.preprocess(blankToUndefined, z.string().min(1).default("./config")),
   })
   .superRefine((env, ctx) => {
-    if (env.INGEST_SOURCE !== "laserstream") return;
-    // Only demand the paid-plan credentials when the paid-plan source is picked,
-    // so a zero-cost pumpportal start validates against a mostly empty .env.
-    for (const key of ["HELIUS_API_KEY", "LASERSTREAM_ENDPOINT"] as const) {
+    const required: Array<"HELIUS_API_KEY" | "LASERSTREAM_ENDPOINT"> = ["HELIUS_API_KEY"];
+    // LaserStream needs its own endpoint on top of the key; helius_logs derives
+    // both of its URLs from the key alone.
+    if (env.INGEST_SOURCE === "laserstream") required.push("LASERSTREAM_ENDPOINT");
+    for (const key of required) {
       if (env[key] === undefined) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: [key],
-          message: `${key} is required when INGEST_SOURCE=laserstream`,
+          message: `${key} is required when INGEST_SOURCE=${env.INGEST_SOURCE}`,
         });
       }
     }
-  });
+  })
+  .transform((env) => ({
+    ...env,
+    // Both endpoints are the same host with the key as a query parameter, so
+    // deriving them keeps one secret in .env instead of three copies of it.
+    SOLANA_RPC_URL:
+      env.SOLANA_RPC_URL ?? `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY ?? ""}`,
+    SOLANA_WS_URL:
+      env.SOLANA_WS_URL ?? `wss://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY ?? ""}`,
+  }));
 export type Env = z.infer<typeof EnvSchema>;
 
 /** Throws on invalid environment. Call once at process start, fail loud. */
