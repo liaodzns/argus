@@ -1,0 +1,23 @@
+{
+  "$comment": "Template. Copy to kol-wallets.json and fill in your own roster; that file is gitignored. Tier 1 is highest conviction and is weighted hardest by the kol_cluster signal, tier 3 is noise that only counts in combination. Reload is hot — the engine watches the file, so you can promote and demote mid-session. The engine reads kol-wallets.json only; the addresses below are structural examples, not recommendations.",
+  "wallets": [
+    {
+      "address": "11111111111111111111111111111111",
+      "label": "example-tier1",
+      "tier": 1,
+      "notes": "Why this wallet earns tier 1. Keep notes honest — you will forget."
+    },
+    {
+      "address": "22222222222222222222222222222222",
+      "label": "example-tier2",
+      "tier": 2,
+      "notes": "Good hit rate but late entries."
+    },
+    {
+      "address": "33333333333333333333333333333333",
+      "label": "example-tier3",
+      "tier": 3,
+      "notes": "Noisy. Only meaningful in combination with others."
+    }
+  ]
+}
