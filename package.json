@@ -1,0 +1,24 @@
+{
+  "name": "argus",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Attention monitor for Solana memecoins. Watches KOL wallets and volume acceleration, surfaces runners and their redeploys on a live chart wall.",
+  "workspaces": ["packages/*"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "dev": "docker compose up -d redis postgres && concurrently -n ingest,engine,gw,web -c cyan,magenta,yellow,green \"npm:dev:*\"",
+    "dev:ingest": "npm run dev -w @argus/ingest",
+    "dev:engine": "npm run dev -w @argus/engine",
+    "dev:gateway": "npm run dev -w @argus/gateway",
+    "dev:web": "npm run dev -w @argus/web",
+    "build": "tsc --build",
+    "typecheck": "tsc --build --force",
+    "replay": "tsx scripts/replay.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "concurrently": "^9.1.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "@argus/gateway",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc --build",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@argus/shared": "*",
+    "fastify": "^5.2.0",
+    "@fastify/websocket": "^11.0.0",
+    "ioredis": "^5.4.0",
+    "pg": "^8.13.0",
+    "pino": "^9.5.0"
+  },
+  "devDependencies": { "@types/pg": "^8.11.0" }
+}

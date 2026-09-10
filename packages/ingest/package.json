@@ -1,0 +1,19 @@
+{
+  "name": "@argus/ingest",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc --build",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@argus/shared": "*",
+    "@triton-one/yellowstone-grpc": "^2.0.0",
+    "@solana/web3.js": "^1.98.0",
+    "ioredis": "^5.4.0",
+    "ws": "^8.18.0",
+    "pino": "^9.5.0"
+  },
+  "devDependencies": { "@types/ws": "^8.5.13" }
+}
