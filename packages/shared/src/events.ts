@@ -219,6 +219,22 @@ export const PanelTickSchema = z.object({
 });
 export type PanelTick = z.infer<typeof PanelTickSchema>;
 
+// --- Socket frames ----------------------------------------------------------
+
+/**
+ * What the gateway sends a browser.
+ *
+ * The bus carries alerts and ticks on separate Redis channels; one socket
+ * carries both, so the frame has to say which it is. This lives in the contract
+ * rather than in the gateway because it crosses a process boundary just like
+ * everything else here.
+ */
+export const ServerFrameSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("alert"), data: AlertPayloadSchema }),
+  z.object({ type: z.literal("tick"), data: PanelTickSchema }),
+]);
+export type ServerFrame = z.infer<typeof ServerFrameSchema>;
+
 // --- Constants --------------------------------------------------------------
 
 /** Redis pub/sub channels. Import these; never inline a channel name. */

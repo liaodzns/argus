@@ -1,16 +1,18 @@
 /**
  * Engine entry point.
  *
- * Step 4 scope: consume trades, maintain one rolling window, print when a
- * watched wallet buys. No scoring, no safety filters, no vamp logic, and no
- * AlertPayload on the bus yet — a payload carrying a fabricated score and an
- * empty safety block would be worse than no payload, and both arrive with the
- * steps that can fill them in honestly.
+ * Consume trades, maintain the rolling windows, and publish an alert plus a
+ * stream of panel ticks when a watched wallet buys.
+ *
+ * Still no safety filters and no vamp logic. The score is a weight-normalised
+ * mean over the one signal that exists, which is a real number rather than a
+ * placeholder, and it widens to the full signal set at step 7 without changing
+ * shape.
  */
 import pino from "pino";
 import { Redis } from "ioredis";
 import { ZodError } from "zod";
-import { CHANNELS, StreamEventSchema } from "@argus/shared";
+import { CHANNELS, KEYS, StreamEventSchema, type TradeEvent } from "@argus/shared";
 import {
   configPaths,
   loadEnv,
@@ -18,8 +20,11 @@ import {
   watchThresholds,
   type Thresholds,
 } from "@argus/shared/config";
-import { createWindows } from "./windows.js";
+import { createWindows, encodeTrade } from "./windows.js";
 import { buildRoster, observeKolTrade, type KolRoster } from "./signals/kol.js";
+import { createEnricher } from "./enrich.js";
+import { buildAlert, claimAlertSlot } from "./alerts.js";
+import { buildTick } from "./ticks.js";
 
 const logger = pino({
   level: process.env["LOG_LEVEL"] ?? "info",
@@ -92,13 +97,104 @@ try {
 }
 
 const windows = createWindows({ redis });
+const enricher = createEnricher({ redis, logger, rpcUrl: env.SOLANA_RPC_URL });
 
 const stats = {
   received: 0,
   malformed: 0,
   kolBuys: 0,
+  alerts: 0,
+  suppressedByCooldown: 0,
+  unresolvedMeta: 0,
+  ticks: 0,
   lastEventAt: 0,
 };
+
+/**
+ * Mints with a panel open, and the score last published for each.
+ *
+ * Ticks go only to these. Publishing a tick for every pump.fun trade would
+ * swamp the socket with tokens nobody is looking at. The real panel budget,
+ * with eviction and pinning, is step 8; this is just the set that has alerted
+ * recently.
+ */
+const active = new Map<string, { expiresAt: number; score: number }>();
+
+async function publish(channel: string, payload: unknown): Promise<void> {
+  await redis.publish(channel, JSON.stringify(payload));
+}
+
+async function handleTrade(trade: TradeEvent): Promise<void> {
+  const thresholds = thresholdsHandle.current;
+  const shortMs = windowMs(thresholds);
+
+  // Every trade feeds the windows, watched or not: volume and buyer counts are
+  // about the token, not about who we happen to follow.
+  await Promise.all([
+    windows.record(KEYS.tradeWindow(trade.mint), encodeTrade({
+      signature: trade.signature, side: trade.side,
+      solLamports: trade.solLamports, trader: trade.trader,
+    }), trade.blockTime, shortMs),
+    trade.side === "buy"
+      ? windows.record(KEYS.buyerWindow(trade.mint), trade.trader, trade.blockTime, shortMs)
+      : Promise.resolve(),
+  ]);
+
+  const hit = await observeKolTrade(trade, roster, windows, shortMs);
+  if (hit !== null) {
+    stats.kolBuys += 1;
+    if (await claimAlertSlot(redis, trade.mint, thresholds.alerting.cooldown_seconds)) {
+      const earliestEventAt =
+        (await windows.earliest(KEYS.kolWindow(trade.mint), trade.blockTime, shortMs)) ??
+        trade.blockTime;
+      const meta = await enricher.resolve(trade.mint, earliestEventAt);
+      if (meta === null) {
+        // Anticipates the step 7 safety rule: a panel with no name on it is not
+        // worth the space. Counted rather than silently dropped.
+        stats.unresolvedMeta += 1;
+        logger.warn({ mint: trade.mint }, "no metadata; not alerting");
+      } else {
+        const addresses = await windows.members(KEYS.kolWindow(trade.mint), trade.blockTime, shortMs);
+        const kols = addresses.map((a) => roster.lookup(a)).filter((w) => w !== undefined);
+        const alert = buildAlert({
+          trade, meta, kols,
+          distinctKols: hit.distinctInWindow,
+          earliestEventAt,
+          thresholds,
+        });
+        await publish(CHANNELS.alerts, alert);
+        active.set(trade.mint, {
+          expiresAt: trade.blockTime + thresholds.wall.panel_ttl_seconds * 1000,
+          score: alert.score,
+        });
+        stats.alerts += 1;
+        logger.info(
+          {
+            mint: alert.mint, symbol: alert.meta.symbol, score: alert.score.toFixed(1),
+            kols: alert.kols.map((k) => k.label), distinct: hit.distinctInWindow,
+            latencyMs: alert.triggeredAt - alert.earliestEventAt,
+          },
+          "ALERT",
+        );
+      }
+    } else {
+      stats.suppressedByCooldown += 1;
+    }
+  }
+
+  const panel = active.get(trade.mint);
+  if (panel === undefined) return;
+  if (trade.blockTime > panel.expiresAt) {
+    active.delete(trade.mint);
+    return;
+  }
+  const tick = await buildTick({ trade, windows, shortWindowMs: shortMs, score: panel.score });
+  await publish(CHANNELS.ticks, tick);
+  stats.ticks += 1;
+}
+
+/** One promise chain per mint, deleted once it drains. */
+const inFlight = new Map<string, Promise<void>>();
 
 await sub.subscribe(CHANNELS.trades);
 sub.on("message", (_channel: string, payload: string) => {
@@ -122,31 +218,26 @@ sub.on("message", (_channel: string, payload: string) => {
   if (event.kind !== "trade") return;
   stats.lastEventAt = event.blockTime;
 
-  void (async () => {
-    try {
-      const hit = await observeKolTrade(event, roster, windows, windowMs(thresholdsHandle.current));
-      if (hit === null) return;
-      stats.kolBuys += 1;
-      logger.info(
-        {
-          mint: hit.trade.mint,
-          kol: hit.wallet.label,
-          tier: hit.wallet.tier,
-          sol: (hit.trade.solLamports / 1e9).toFixed(4),
-          distinctKolsInWindow: hit.distinctInWindow,
-          venue: hit.trade.venue,
-          slot: hit.trade.slot,
-        },
-        "KOL BUY",
-      );
-    } catch (error) {
-      logger.error({ err: String(error), mint: event.mint }, "window update failed");
-    }
-  })();
+  // Serialised per mint. Two trades on one token would otherwise interleave
+  // between a window write and the read that follows it, and the distinct
+  // counts that come back would depend on which promise resolved first.
+  const previous = inFlight.get(event.mint) ?? Promise.resolve();
+  const next = previous
+    .then(() => handleTrade(event))
+    .catch((error: unknown) => {
+      logger.error({ err: String(error), mint: event.mint }, "trade handling failed");
+    })
+    .finally(() => {
+      if (inFlight.get(event.mint) === next) inFlight.delete(event.mint);
+    });
+  inFlight.set(event.mint, next);
 });
 
 const heartbeat = setInterval(() => {
-  logger.info({ ...stats, wallets: roster.size }, "engine stats");
+  logger.info(
+    { ...stats, wallets: roster.size, activePanels: active.size, meta: enricher.stats },
+    "engine stats",
+  );
 }, 15_000);
 heartbeat.unref();
 
@@ -172,6 +263,7 @@ logger.info(
     wallets: roster.size,
     shortWindowSeconds: thresholdsHandle.current.windows.short,
     channel: CHANNELS.trades,
+    publishes: [CHANNELS.alerts, CHANNELS.ticks],
   },
   "engine listening",
 );
