@@ -248,6 +248,24 @@ export const CHANNELS = {
 export type ChannelName = (typeof CHANNELS)[keyof typeof CHANNELS];
 
 /**
+ * Which channel an event belongs on.
+ *
+ * Part of the bus contract rather than a detail of whoever happens to be
+ * publishing, so ingest and the replay tool cannot disagree about where a
+ * migration goes.
+ */
+export const channelForEvent = (event: StreamEvent): ChannelName => {
+  switch (event.kind) {
+    case "trade":
+      return CHANNELS.trades;
+    case "mint":
+      return CHANNELS.mints;
+    case "migration":
+      return CHANNELS.migrations;
+  }
+};
+
+/**
  * Redis key builders. Import these; never inline a key string.
  *
  * Every window is a sorted set scored by block time. Evict with

@@ -52,21 +52,6 @@ export const EnvSchema = z
     // Where thresholds.yml and kol-wallets.json live.
     ARGUS_CONFIG_DIR: z.preprocess(blankToUndefined, z.string().min(1).default("./config")),
   })
-  .superRefine((env, ctx) => {
-    const required: Array<"HELIUS_API_KEY" | "LASERSTREAM_ENDPOINT"> = ["HELIUS_API_KEY"];
-    // LaserStream needs its own endpoint on top of the key; helius_logs derives
-    // both of its URLs from the key alone.
-    if (env.INGEST_SOURCE === "laserstream") required.push("LASERSTREAM_ENDPOINT");
-    for (const key of required) {
-      if (env[key] === undefined) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: [key],
-          message: `${key} is required when INGEST_SOURCE=${env.INGEST_SOURCE}`,
-        });
-      }
-    }
-  })
   .transform((env) => ({
     ...env,
     // Both endpoints are the same host with the key as a query parameter, so
@@ -78,10 +63,44 @@ export const EnvSchema = z
   }));
 export type Env = z.infer<typeof EnvSchema>;
 
-/** Throws on invalid environment. Call once at process start, fail loud. */
-export function loadEnv(source: Record<string, string | undefined> = process.env): Env {
-  return EnvSchema.parse(source);
+export interface LoadEnvOptions {
+  /**
+   * Demand the credentials needed to open a chain stream.
+   *
+   * Only ingest opens one. The engine, the gateway and the replay tool all run
+   * happily without a provider key, and making them carry one means a dummy
+   * value in every .env that does not ingest — which is how a required secret
+   * quietly becomes a meaningless one.
+   */
+  requireChainSource?: boolean;
 }
+
+/** Throws on invalid environment. Call once at process start, fail loud. */
+export function loadEnv(
+  source: Record<string, string | undefined> = process.env,
+  options: LoadEnvOptions = {},
+): Env {
+  const env = EnvSchema.parse(source);
+  if (options.requireChainSource !== true) return env;
+
+  const required: Array<"HELIUS_API_KEY" | "LASERSTREAM_ENDPOINT"> = ["HELIUS_API_KEY"];
+  // LaserStream needs its own endpoint on top of the key; helius_logs derives
+  // both of its URLs from the key alone.
+  if (env.INGEST_SOURCE === "laserstream") required.push("LASERSTREAM_ENDPOINT");
+  const issues: z.ZodIssue[] = required
+    .filter((key) => env[key] === undefined)
+    .map((key) => ({
+      code: z.ZodIssueCode.custom,
+      path: [key],
+      message: `${key} is required when INGEST_SOURCE=${env.INGEST_SOURCE}`,
+    }));
+  // A ZodError so every caller's existing error formatting still applies.
+  if (issues.length > 0) throw new z.ZodError(issues);
+  return env;
+}
+
+/** True when metadata can fall back to Helius DAS for mints DexScreener has not indexed. */
+export const hasChainCredentials = (env: Env): boolean => env.HELIUS_API_KEY !== undefined;
 
 export interface ConfigPaths {
   dir: string;

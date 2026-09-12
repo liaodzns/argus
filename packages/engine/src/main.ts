@@ -15,6 +15,7 @@ import { ZodError } from "zod";
 import { CHANNELS, KEYS, StreamEventSchema, type TradeEvent } from "@argus/shared";
 import {
   configPaths,
+  hasChainCredentials,
   loadEnv,
   watchKolWallets,
   watchThresholds,
@@ -48,6 +49,13 @@ try {
     "Invalid environment. Copy .env.example to .env and fill in:",
     error.issues.map((i) => `  ${i.path.join(".") || "(root)"}: ${i.message}`).join("\n"),
   );
+}
+
+// DexScreener is the primary metadata source and needs no key. Without one the
+// DAS fallback is gone, and the mints that lose are the newest — exactly the
+// ones this product exists to catch.
+if (!hasChainCredentials(env)) {
+  logger.warn("no HELIUS_API_KEY; metadata falls back to DexScreener only, which does not carry fresh mints");
 }
 
 const paths = configPaths(env);
@@ -143,7 +151,7 @@ async function handleTrade(trade: TradeEvent): Promise<void> {
   const hit = await observeKolTrade(trade, roster, windows, shortMs);
   if (hit !== null) {
     stats.kolBuys += 1;
-    if (await claimAlertSlot(redis, trade.mint, thresholds.alerting.cooldown_seconds)) {
+    if (await claimAlertSlot(redis, trade.mint, trade.blockTime, thresholds.alerting.cooldown_seconds)) {
       const earliestEventAt =
         (await windows.earliest(KEYS.kolWindow(trade.mint), trade.blockTime, shortMs)) ??
         trade.blockTime;
