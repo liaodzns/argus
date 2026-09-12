@@ -6,6 +6,9 @@
     },
     {
       "path": "packages/ingest"
+    },
+    {
+      "path": "packages/engine"
     }
   ]
 }
