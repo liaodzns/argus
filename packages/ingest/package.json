@@ -1,0 +1,23 @@
+{
+  "name": "@argus/ingest",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=../../.env src/main.ts",
+    "build": "tsc --build",
+    "start": "node --env-file-if-exists=../../.env dist/main.js"
+  },
+  "dependencies": {
+    "@argus/shared": "*",
+    "@solana/web3.js": "^1.98.0",
+    "@triton-one/yellowstone-grpc": "^2.0.0",
+    "ioredis": "^5.4.0",
+    "pino": "^9.5.0",
+    "ws": "^8.18.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.13",
+    "pino-pretty": "^13.0.0"
+  }
+}

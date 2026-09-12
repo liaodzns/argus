@@ -1,0 +1,17 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "packages/shared"
+    },
+    {
+      "path": "packages/ingest"
+    },
+    {
+      "path": "packages/engine"
+    },
+    {
+      "path": "packages/gateway"
+    }
+  ]
+}

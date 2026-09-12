@@ -1,0 +1,89 @@
+# Tuning lives here, not in code. The engine hot-reloads this file on change,
+# so you can adjust mid-session without dropping the gRPC stream.
+#
+# Every number below is a guess. Do not trust them. Record a session with
+# `npm run replay -- --record`, then tune against a window where you already
+# know what ran. That offline loop is worth more than any amount of live
+# guessing.
+
+windows:
+  # All windows are in seconds and measured on block time, not wall clock.
+  short: 60
+  medium: 300
+  # Trailing baseline that `short` is compared against for the z-score.
+  baseline: 1800
+
+signals:
+  volume_zscore:
+    weight: 0.25
+    # Below this, treat as noise regardless of z-score. A 10x move on 30 SOL of
+    # volume is meaningless.
+    min_volume_sol: 15
+    # z at which the normalized signal value reaches 1.0.
+    saturate_at: 4.0
+
+  unique_buyer_rate:
+    weight: 0.20
+    # New distinct buyers per minute that maps to 1.0.
+    saturate_at: 40
+    # Guards against one funder splitting across many fresh wallets. Requires
+    # a funding-source lookup; skip in v1 and revisit.
+    exclude_common_funder: false
+
+  buy_pressure:
+    weight: 0.10
+    # buys / (buys + sells) by SOL volume in the short window.
+    neutral: 0.5
+    saturate_at: 0.80
+
+  kol_cluster:
+    weight: 0.30
+    # Distinct KOL wallets buying within `short` to fire at all.
+    min_distinct: 2
+    # Count that maps to 1.0.
+    saturate_at: 5
+    tier_multipliers: { "1": 1.0, "2": 0.6, "3": 0.35 }
+
+  migration:
+    weight: 0.05
+    # One-shot boost, decayed over this many seconds after the migration.
+    decay_seconds: 600
+
+  vamp_of_runner:
+    weight: 0.10
+    # A token qualifies as a "runner" (parent) at this score, held for
+    # `runner_ttl`. New mints are matched against the active runner set.
+    runner_score: 70
+    runner_ttl: 3600
+    # Weighted Jaro-Winkler on name and symbol; phash Hamming on image.
+    min_similarity: 0.72
+    # Only consider mints this fresh as vamp candidates.
+    candidate_max_age: 900
+
+safety:
+  # Hard filters. Failing any of these suppresses the alert entirely — the
+  # score is not consulted. Keep these strict; a wall full of rugs is worse
+  # than an empty wall.
+  reject_if_mint_authority_live: true
+  reject_if_freeze_authority_live: true
+  max_top_holder_pct: 0.25
+  max_dev_holding_pct: 0.12
+  # Skip tokens whose metadata URI never resolves.
+  require_resolvable_metadata: true
+
+alerting:
+  min_score: 55
+  # Per-mint silence after an alert. Without this one token fires continuously
+  # and crowds out everything else.
+  cooldown_seconds: 300
+  # Re-alert inside the cooldown only if the score improves by this much.
+  escalation_delta: 20
+
+wall:
+  # Human attention is the real constraint. More panels than this and you are
+  # not watching any of them.
+  max_panels: 9
+  # Panels below this score are evicted (lowest first) when the wall is full.
+  evict_below: 45
+  # Pinned panels are never evicted and do not count against max_panels.
+  panel_ttl_seconds: 900
