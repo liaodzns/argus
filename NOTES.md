@@ -407,6 +407,61 @@ reflects on sniper wallets and on my test design, not on the roster.
 This is the one place v2 spends real money — see the cost note in `PIVOT.md`
 section 4 — so it is the first number to measure.
 
+### v2 step 6 — The screen (2026-09-18)
+
+The panel opens on your buy rather than on the alert. That was a deliberate
+choice against the quieter option: a screen that stays empty until something
+happens cannot be told apart from a screen that is broken, which is the exact
+failure that cost an afternoon at step 1.
+
+**Alerts alone therefore cannot drive the screen**, so `PositionState` is
+published on every change to a watch: opened, narrative resolved, clone found,
+roster buy, alerted, closed. It overlaps `AlertPayload` on purpose. One is a
+live view model the browser re-renders from, the other is the durable record of
+an event. Collapsing them would force either the browser to rebuild state from
+a stream of events, or the record to carry view concerns.
+
+Verified end to end through Redis, the gateway and a socket client: 30 position
+frames, 152 ticks, nothing unparseable, and the panel walked its whole life.
+
+| Panel state | meta | clones | tracked buyers |
+|---|---|---|---|
+| watching | null | 0 | 0 |
+| watching | THURSDAY | 0 | 0 |
+| watching | THURSDAY | 24 | 0 |
+| watching | THURSDAY | 24 | 1 |
+| VAMPED, score 49 | THURSDAY | 24 | 2 |
+| CLOSED, sold | THURSDAY | 24 | 2 |
+
+The first row matters: the panel exists before enrichment resolves, so the UI
+renders "resolving…" rather than waiting. The last row matters too — a closed
+watch removes the panel instead of leaving it up with a badge, or the screen
+would slowly fill with history.
+
+**Comparison bars beat a candlestick chart here.** The question is whether a
+clone is outpacing you, which is a shape rather than two numbers. Your token is
+always the first row so the comparison has a fixed anchor, bars scale to the
+busiest row, and a sparkline gives direction. `lightweight-charts` went with the
+candle panel, taking the bundle from 65.9 kB to 17.4 kB. `zustand` was also
+dropped: it had been a dependency since the v1 scaffold and was never imported.
+
+**The panel caps at six clone rows.** A real wave produced 24, and 24 rows is
+not a three second read. The engine still sends all of them; deciding what is
+worth drawing is the screen's job.
+
+### Two bits of dead code the reshape exposed
+
+`PanelTick` had promised `buyers1m`, which nothing has ever counted, and
+`volumeSol1m` as though exact when it is a sampled estimate. Reshaping it
+revealed `buildTick` in the engine, which had no callers and would have emitted
+an invalid frame if it ever gained one. It is gone, and `ticks.ts` became
+`price.ts` because `priceSolOf` was all that was left in it.
+
+**A hazard worth remembering:** `schema.parse()` takes `unknown`, so a stale
+object shape does *not* fail typecheck. `buildTick` compiled cleanly while being
+wrong. The type contract catches shape drift at a function boundary but not at a
+`parse()` call, which is exactly where it is most tempting to assume it will.
+
 ### v2 step 5 — The alert (2026-09-17)
 
 **Roster buys turned out to be free**, which was the open question from step 4.

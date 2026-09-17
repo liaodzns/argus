@@ -287,6 +287,11 @@ way. There is nothing to gain.
 - **The alert is keyed on your position**, carrying `clones[]`.
   `NarrativeCluster` is gone: it pointed the wrong way for v2 and had no
   producer.
+- **The screen is driven by `PositionState`, not by alerts.** A panel opens when
+  you buy, so a working tool is distinguishable from a broken one.
+  `AlertPayload` remains the durable record on its own channel.
+- **No candlestick charts.** Comparison bars answer "is a clone outpacing me"
+  faster than a chart does, and `lightweight-charts` is gone with them.
 - **No persistence and no restart recovery.** A watch is a timer, not a
   position. The operator closes out and monitors longer holds elsewhere.
 - **Monitoring keys on the mint, never on a venue account.** That is what makes
@@ -357,8 +362,10 @@ Each step keeps a verification gate. Same discipline as before.
 5. **The alert.** Roster buys on a clone trigger it; trade-rate share confirms.
    *Gate:* the same recorded wave fires with roster buys and stays silent
    without them.
-6. **The panel.** Your position against its suspects, one screen, Axiom link.
-   *Gate:* you can decide in under three seconds.
+6. **The screen.** The panel opens on your buy and goes loud on the alert. Your
+   trade rate as a bar with every clone beneath it, a price sparkline per row,
+   tracked wallets named, one Axiom button.
+   *Gate:* you can act on it in three seconds without reading carefully.
 
 Step 5 is the one that needs real recorded sessions, and it is the reason the
 replay harness survives the pivot.

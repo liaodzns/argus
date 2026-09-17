@@ -9,6 +9,119 @@ several defects are squashed into one commit message.
 
 ---
 
+## Change set: step 6, the screen
+
+**Branch:** `feat/v2-the-screen` · **Base:** `70596d7` (step 5 merged)
+
+**Context.** Everything Argus decides has so far landed in a terminal log line.
+This puts it on a screen readable in three seconds while a token is moving.
+
+**Two design decisions, both confirmed with the operator.** The panel opens on
+your buy rather than on the alert, because a screen that stays empty until
+something happens cannot be told apart from a broken one. And the layout is
+comparison bars rather than a candlestick chart, because the question is whether
+a clone is outpacing you, which is a shape rather than two numbers.
+
+| Check | Result |
+|---|---|
+| Frames through Redis, gateway and a socket client | 30 position, 152 tick, 0 unparseable |
+| Panel state sequence | watching → resolved → 24 clones → 1 buyer → VAMPED 49 → closed |
+| Closed watch removes the panel | yes |
+| `next build` | passes, 65.9 kB → 17.4 kB |
+| Page server-renders its empty state | yes |
+
+**Diff:** 14 files, +331 / −275.
+
+---
+
+### 1. `feat(shared): add PositionState and reshape PanelTick`
+
+`PositionState` is what a panel draws, republished on every change to a watch,
+because the screen has to exist before any alert does. It overlaps
+`AlertPayload` deliberately: one is a live view model, the other the durable
+record of an event, and the code says so.
+
+`PanelTick` loses `buyers1m`, which nothing has ever counted, and renames
+`volumeSol1m` to `estimatedVolumeSolPerMin`, because it is sampled size times
+rate rather than a sum. `score` moves off the tick — a clone does not have one —
+and `blockTime` becomes `observedAt`, since rate comes from the arrival-stamped
+activity window.
+
+**Files.** `packages/shared/src/events.ts`.
+
+---
+
+### 2. `refactor(engine): delete the dead tick builder`
+
+Reshaping `PanelTick` exposed `buildTick`, which had no callers and would have
+emitted an invalid frame if it gained one. `ticks.ts` becomes `price.ts` because
+`priceSolOf` was all that remained in it.
+
+Worth recording: `schema.parse()` takes `unknown`, so the stale shape did not
+fail typecheck. The contract catches drift at a function boundary but not at a
+`parse()` call, which is where it is most tempting to assume it will.
+
+**Files.** `packages/engine/src/price.ts`, `packages/engine/src/flow.ts`,
+deletes `packages/engine/src/ticks.ts`.
+
+---
+
+### 3. `feat(engine): publish position state and panel ticks`
+
+A frame on every watch change, and a tick per monitored mint on an interval from
+the flow readings the engine already computes. Step 4 withheld ticks because the
+old shape demanded a score nothing had; the new shape does not ask for one.
+
+The close frame is published with the watch passed in rather than looked up,
+because by then it is already gone from the map — and without that frame a panel
+would stay on screen forever.
+
+**Files.** `packages/engine/src/main.ts`, `config/thresholds.yml`,
+`packages/shared/src/config.ts`.
+
+---
+
+### 4. `feat(gateway): fan out positions instead of alerts`
+
+One line of substance. `AlertPayload` stays on its own channel as the durable
+record for a history route that does not exist yet.
+
+**Files.** `packages/gateway/src/ws.ts`.
+
+---
+
+### 5. `feat(web): replace the chart panel with a comparison view`
+
+Your trade rate as a bar with every clone beneath it, scaled to the busiest row,
+your token always first so the comparison has a fixed anchor. A hand-rolled SVG
+sparkline per row for direction. Tracked wallets named, because they are the
+trigger and a name is what makes it credible. Capped at six clone rows, since a
+real wave produced 24.
+
+Drops `lightweight-charts` with the candle panel, and `zustand`, which had been
+a dependency since the v1 scaffold and was never imported.
+
+**Files.** `packages/web/src/components/PositionPanel.tsx`,
+`packages/web/src/components/Sparkline.tsx`,
+`packages/web/src/hooks/useAlertSocket.ts`, `packages/web/src/app/page.tsx`,
+`packages/web/package.json`, deletes
+`packages/web/src/components/ChartPanel.tsx`.
+
+---
+
+### 6. `docs: record step 6 and the parse() hazard`
+
+**Files.** `NOTES.md`, `PIVOT.md`, `COMMITS.md`.
+
+---
+
+### Suggested order
+
+1 → 2 → 3 → 4 → 5 → 6. Contract, the cleanup it exposed, producer, relay,
+screen, docs.
+
+---
+
 ## Change set: step 5, the alert
 
 **Branch:** `feat/v2-the-alert` · **Base:** `fc894a3` (step 4 merged)
