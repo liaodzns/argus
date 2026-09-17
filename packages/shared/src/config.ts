@@ -49,7 +49,17 @@ export const EnvSchema = z
       z.string().min(1).default("ws://localhost:8080/ws"),
     ),
 
-    // Where thresholds.yml and kol-wallets.json live.
+    /**
+     * The wallet Argus watches. For Axiom this is its trading wallet, which is
+     * not the funding wallet you would name first. Public address, not a
+     * secret, but user-specific so it stays out of the repository.
+     */
+    WATCHED_WALLET: z.preprocess(
+      blankToUndefined,
+      z.string().regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/, "expected a base58 Solana address").optional(),
+    ),
+
+    // Where thresholds.yml lives.
     ARGUS_CONFIG_DIR: z.preprocess(blankToUndefined, z.string().min(1).default("./config")),
   })
   .transform((env) => ({
@@ -124,6 +134,10 @@ const Seconds = z.number().int().positive();
 const Fraction = z.number().min(0).max(1);
 
 export const ThresholdsSchema = z.object({
+  watch: z.object({
+    /** How long after a buy to keep matching new mints against it. */
+    window_seconds: Seconds,
+  }),
   windows: z.object({
     short: Seconds,
     medium: Seconds,
