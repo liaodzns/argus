@@ -10,7 +10,7 @@
  * That decision deletes balance reads, token account subscriptions, restart
  * reconciliation and a dust threshold. See NOTES.md.
  */
-import type { Address, Timestamp, TokenMeta, TradeEvent } from "@argus/shared";
+import type { Address, NarrativeMatch, Timestamp, TokenMeta, TradeEvent } from "@argus/shared";
 
 export interface Watch {
   mint: Address;
@@ -25,6 +25,18 @@ export interface Watch {
    * narrative yet rather than assuming one is always present.
    */
   meta: TokenMeta | null;
+  /** Clones found since this watch opened, keyed by mint. */
+  suspects: Map<string, Suspect>;
+}
+
+/** A launch that matched a watch's narrative, and is therefore worth watching. */
+export interface Suspect {
+  mint: Address;
+  symbol: string;
+  name: string;
+  similarity: number;
+  matchedOn: NarrativeMatch[];
+  firstSeenAt: Timestamp;
 }
 
 export type WatchCloseReason = "sold" | "expired";
@@ -40,6 +52,15 @@ export interface WatchesStats {
 }
 
 export interface WatchesOptions {
+  /**
+   * The wallet whose fills open and close watches.
+   *
+   * Required rather than optional because market trades now share a channel
+   * with your own fills. Guarding inside this module makes a stranger's sell
+   * closing your watch structurally impossible, instead of relying on every
+   * call site to check first. Wrongly closing a watch means missing a vamp.
+   */
+  wallet: Address;
   /**
    * Read as a function, not a value, so a hot-reloaded window length applies to
    * the next watch without restarting anything.
@@ -72,6 +93,15 @@ export function createWatches(options: WatchesOptions) {
       return [...watches.values()];
     },
 
+    /** Record a clone. Returns false if the watch has already closed. */
+    addSuspect(mint: string, suspect: Suspect): boolean {
+      const watch = watches.get(mint);
+      if (watch === undefined) return false;
+      if (watch.suspects.has(suspect.mint)) return false;
+      watch.suspects.set(suspect.mint, suspect);
+      return true;
+    },
+
     /** Attach the narrative once enrichment has resolved it. */
     describe(mint: string, meta: TokenMeta): boolean {
       const watch = watches.get(mint);
@@ -81,6 +111,8 @@ export function createWatches(options: WatchesOptions) {
     },
 
     observe(trade: TradeEvent): void {
+      // Not our fill, so it says nothing about whether we hold anything.
+      if (trade.trader !== options.wallet) return;
       if (trade.side === "buy") {
         const existing = watches.get(trade.mint);
         if (existing !== undefined) {
@@ -97,6 +129,7 @@ export function createWatches(options: WatchesOptions) {
           entrySolLamports: trade.solLamports,
           expiresAt: trade.blockTime + options.windowMs(),
           meta: null,
+          suspects: new Map(),
         };
         watches.set(trade.mint, watch);
         stats.opened += 1;
