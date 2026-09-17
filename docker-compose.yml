@@ -17,7 +17,10 @@ services:
       POSTGRES_DB: argus
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./scripts/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    # No schema mount. scripts/schema.sql never existed, and Docker silently
+    # created a *directory* at that path rather than failing, so the mount was a
+    # lie that looked fine. Nothing uses Postgres yet — alert history has no
+    # route — so it stays empty until something needs a table.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U argus"]
       interval: 5s
