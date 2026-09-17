@@ -1,18 +1,20 @@
 /**
  * Ingest entry point.
  *
- * Two sources, both onto the bus. The wallet watcher decodes your own fills.
+ * Three sources, all onto the bus. The wallet watcher decodes your own fills.
  * The launch watcher reports every new pump.fun token so the engine can match
- * them against what you hold.
+ * them against what you hold. The monitor holds a log subscription per mint the
+ * engine asks about, reporting flow for free and sampling prices sparingly.
  *
  * The firehose that read every pump.fun trade is gone; see PIVOT.md for why.
  */
 import pino from "pino";
 import { Redis } from "ioredis";
 import { ZodError } from "zod";
-import { loadEnv } from "@argus/shared/config";
+import { configPaths, loadEnv, watchThresholds } from "@argus/shared/config";
 import { createWalletWatcher } from "./streams/wallet.js";
 import { createLaunchWatcher } from "./streams/launches.js";
+import { createMonitor } from "./streams/monitor.js";
 import { createPublisher } from "./publish.js";
 
 function readEnv(): ReturnType<typeof loadEnv> {
@@ -61,6 +63,20 @@ try {
   logger.warn({ redis: env.REDIS_URL }, "redis unreachable; printing fills only, not publishing");
 }
 
+// Sampling rates are operator tuning, so they are hot-reloaded like everything
+// else rather than fixed at start.
+const paths = configPaths(env);
+let thresholds: ReturnType<typeof watchThresholds>;
+try {
+  thresholds = watchThresholds(paths.thresholds, {
+    onError: (error) =>
+      logger.error({ err: String(error) }, "thresholds reload failed; keeping previous"),
+  });
+} catch (error) {
+  process.stderr.write(`Could not load ${paths.thresholds}\n  ${String(error)}\n`);
+  process.exit(1);
+}
+
 const controller = new AbortController();
 const watcher = createWalletWatcher({
   wsUrl: env.SOLANA_WS_URL,
@@ -87,7 +103,12 @@ const watcher = createWalletWatcher({
 // sign of trouble. It exists to show the socket is still attached.
 const heartbeat = setInterval(() => {
   logger.info(
-    { wallet: watcher.stats, launches: launches.stats, publishing: publisher !== null },
+    {
+      wallet: watcher.stats,
+      launches: launches.stats,
+      monitor: { ...monitor.stats, held: monitor.held().length },
+      publishing: publisher !== null,
+    },
     "watching",
   );
 }, 60_000);
@@ -100,6 +121,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     shuttingDown = true;
     logger.info({ signal }, "shutting down");
     clearInterval(heartbeat);
+    thresholds.close();
     controller.abort();
     void (async () => {
       await publisher?.close();
@@ -117,9 +139,24 @@ const launches = createLaunchWatcher({
   },
 });
 
+const monitor = createMonitor({
+  wsUrl: env.SOLANA_WS_URL,
+  rpcUrl: env.SOLANA_RPC_URL,
+  redis,
+  logger,
+  onEvent: (event) => publisher?.publish(event),
+  sampleIntervalMs: () => thresholds.current.monitor.price_sample_ms,
+  maxPriced: () => thresholds.current.monitor.max_priced,
+  refreshMs: thresholds.current.monitor.set_refresh_ms,
+});
+
 logger.info({ wallet, rpc: env.SOLANA_WS_URL.split("?")[0] }, "argus ingest starting");
 
 // Both run until aborted. Either failing independently is the point of giving
 // them separate reconnect loops, so a dead launch feed cannot take your fills
 // down with it.
-await Promise.all([watcher.start(controller.signal), launches.start(controller.signal)]);
+await Promise.all([
+  watcher.start(controller.signal),
+  launches.start(controller.signal),
+  monitor.start(controller.signal),
+]);
