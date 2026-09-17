@@ -75,17 +75,32 @@ export const TradeEventSchema = z.object({
 });
 export type TradeEvent = z.infer<typeof TradeEventSchema>;
 
+/**
+ * A new token launch.
+ *
+ * Shaped to its only producer, PumpPortal's free creation feed, which carries
+ * no slot and no block time. Those fields were specified for a chain-derived
+ * source and lost their producer when the firehose was deleted, so rather than
+ * carry two fields nothing can fill, this records when the launch was observed
+ * and says so.
+ *
+ * `observedAt` is wall clock, the second documented exception to the block-time
+ * rule after `AlertPayload.triggeredAt`. It is honest for what it is: the
+ * moment this process heard about the launch, not the moment it happened.
+ * Nothing downstream may treat it as chain time or put it in a rolling window.
+ */
 export const MintEventSchema = z.object({
   kind: z.literal("mint"),
   mint: AddressSchema,
   signature: SignatureSchema,
-  slot: SlotSchema,
-  blockTime: TimestampSchema,
   creator: AddressSchema,
   name: z.string(),
   symbol: z.string(),
-  /** Off-chain metadata URI. May not resolve; that is a safety rejection. */
+  /** Off-chain metadata URI. Two launches sharing one are byte-identical. */
   uri: z.string(),
+  /** Bonding curve account, free from the feed. Step 4 subscribes to it. */
+  bondingCurve: AddressSchema,
+  observedAt: TimestampSchema,
 });
 export type MintEvent = z.infer<typeof MintEventSchema>;
 
@@ -176,7 +191,14 @@ export type SafetyFlags = z.infer<typeof SafetyFlagsSchema>;
 
 // --- Outbound ---------------------------------------------------------------
 
-export const NarrativeMatchSchema = z.enum(["name", "symbol", "image", "socials"]);
+/** `metadata` means an identical metadata URI, so the two are byte-identical. */
+export const NarrativeMatchSchema = z.enum([
+  "name",
+  "symbol",
+  "metadata",
+  "image",
+  "socials",
+]);
 export type NarrativeMatch = z.infer<typeof NarrativeMatchSchema>;
 
 export const NarrativeClusterSchema = z.object({
@@ -254,6 +276,17 @@ export type ChannelName = (typeof CHANNELS)[keyof typeof CHANNELS];
  * publishing, so ingest and the replay tool cannot disagree about where a
  * migration goes.
  */
+/**
+ * The timestamp an event is ordered by.
+ *
+ * Trades and migrations carry block time. A launch carries only `observedAt`,
+ * because its source has no chain timestamp. Anything that paces, sorts or
+ * replays a mixed stream has to go through here rather than reaching for
+ * `blockTime` and quietly excluding launches.
+ */
+export const eventTime = (event: StreamEvent): Timestamp =>
+  event.kind === "mint" ? event.observedAt : event.blockTime;
+
 export const channelForEvent = (event: StreamEvent): ChannelName => {
   switch (event.kind) {
     case "trade":

@@ -116,7 +116,10 @@ export function createPublisher(options: PublisherOptions) {
 
     publish(event: StreamEvent): void {
       buffer.push([channelForEvent(event), JSON.stringify(event)]);
-      pendingSlot = Math.max(pendingSlot, event.slot);
+      // The cursor records chain position, and a launch has none: the creation
+      // feed reports when we heard about a mint, not which slot confirmed it.
+      // Advancing the cursor from an observation timestamp would corrupt it.
+      if (event.kind !== "mint") pendingSlot = Math.max(pendingSlot, event.slot);
       stats.bufferDepth = buffer.length;
 
       if (buffer.length >= warnDepth && buffer.length >= warnedAtDepth * 2) {
