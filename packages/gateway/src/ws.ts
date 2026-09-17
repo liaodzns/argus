@@ -8,6 +8,10 @@
  * Frames are relayed as they arrive. The gateway validates rather than
  * reshapes: if something malformed reaches the bus, it dies here instead of on
  * a chart axis.
+ *
+ * Positions rather than alerts, because the panel exists before any alert does:
+ * it opens when you buy. `AlertPayload` stays on its own channel as the durable
+ * record, for a history route that does not exist yet.
  */
 import { Redis } from "ioredis";
 import type { WebSocket } from "ws";
@@ -33,7 +37,7 @@ export function createFanOut(options: FanOutOptions) {
   const { logger } = options;
   const clients = new Set<WebSocket>();
   const sub = new Redis(options.redisUrl, { maxRetriesPerRequest: null });
-  const stats = { clients: 0, alerts: 0, ticks: 0, dropped: 0, malformed: 0 };
+  const stats = { clients: 0, positions: 0, ticks: 0, dropped: 0, malformed: 0 };
 
   sub.on("error", (error: Error) => logger.error({ err: error.message }, "gateway redis error"));
 
@@ -57,7 +61,7 @@ export function createFanOut(options: FanOutOptions) {
     stats,
 
     async start(): Promise<void> {
-      await sub.subscribe(CHANNELS.alerts, CHANNELS.ticks);
+      await sub.subscribe(CHANNELS.positions, CHANNELS.ticks);
       sub.on("message", (channel: string, payload: string) => {
         let parsed: unknown;
         try {
@@ -66,18 +70,18 @@ export function createFanOut(options: FanOutOptions) {
           stats.malformed += 1;
           return;
         }
-        const type = channel === CHANNELS.alerts ? "alert" : "tick";
+        const type = channel === CHANNELS.positions ? "position" : "tick";
         const frame = ServerFrameSchema.safeParse({ type, data: parsed });
         if (!frame.success) {
           stats.malformed += 1;
           logger.warn({ channel, issues: frame.error.issues.length }, "dropped malformed frame");
           return;
         }
-        if (type === "alert") stats.alerts += 1;
+        if (type === "position") stats.positions += 1;
         else stats.ticks += 1;
         broadcast(frame.data);
       });
-      logger.info({ channels: [CHANNELS.alerts, CHANNELS.ticks] }, "fan-out subscribed");
+      logger.info({ channels: [CHANNELS.positions, CHANNELS.ticks] }, "fan-out subscribed");
     },
 
     add(client: WebSocket): void {
