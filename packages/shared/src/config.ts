@@ -142,6 +142,7 @@ export const ThresholdsSchema = z.object({
     price_sample_ms: z.number().int().positive(),
     max_priced: z.number().int().positive(),
     set_refresh_ms: z.number().int().positive(),
+    tick_interval_ms: z.number().int().positive(),
   }),
   narrative: z.object({
     min_similarity: Fraction,

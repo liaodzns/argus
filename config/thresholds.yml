@@ -24,6 +24,9 @@ monitor:
   max_priced: 5
   # How often ingest reconciles its subscriptions against the engine's set.
   set_refresh_ms: 2000
+  # How often a panel tick is published per monitored mint. Short enough that a
+  # sparkline moves, long enough that a 25-clone wave is not a flood.
+  tick_interval_ms: 2000
 
 narrative:
   # Similarity at or above which a new launch counts as a clone of something you

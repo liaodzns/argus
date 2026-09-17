@@ -19,12 +19,14 @@ import {
   CHANNELS,
   KEYS,
   StreamEventSchema,
+  PositionStateSchema,
   type Clone,
   type MintEvent,
+  type PositionState,
   type TradeEvent,
 } from "@argus/shared";
 import { configPaths, loadEnv, watchKolWallets, watchThresholds } from "@argus/shared/config";
-import { createWatches } from "./watches.js";
+import { createWatches, type Watch, type WatchCloseReason } from "./watches.js";
 import { createEnricher } from "./enrich.js";
 import { matchNarrative } from "./narrative.js";
 import { createWindows } from "./windows.js";
@@ -92,6 +94,7 @@ const watches = createWatches({
     );
     void describe(watch.mint, watch.openedAt);
     void publishMonitored();
+    void publishPosition(watch);
   },
   onClose: (watch, reason) => {
     logger.info(
@@ -103,8 +106,13 @@ const watches = createWatches({
       },
       "WATCH CLOSED",
     );
-    flow.forget(watch.mint);
-    for (const suspect of watch.suspects.keys()) flow.forget(suspect);
+    // Published before the flow state is dropped, and before the watch is gone
+    // from the map, so the screen learns why the panel is going away.
+    void publishPosition(watch, reason).finally(() => {
+      alerted.delete(watch.mint);
+      flow.forget(watch.mint);
+      for (const suspect of watch.suspects.keys()) flow.forget(suspect);
+    });
     void publishMonitored();
   },
 });
@@ -154,6 +162,79 @@ const flow = createFlow({
  * always authoritative and a missed delta cannot leave a stale subscription
  * alive. Ingest polls this and diffs; there is no protocol between them.
  */
+/**
+ * Snapshot a watch as the screen sees it.
+ *
+ * Read from the watch itself rather than accumulated separately, so the panel
+ * cannot drift from engine state. Clones carry their live flow readings, which
+ * is why this is async.
+ */
+async function positionStateOf(
+  watch: Watch,
+  extras: { alerted: boolean; score: number | null; closed: boolean; closeReason: string | null },
+): Promise<PositionState> {
+  const now = Date.now();
+  const clones: Clone[] = [];
+  for (const suspect of watch.suspects.values()) {
+    const reading = await flow.read(suspect.mint, now);
+    clones.push({
+      mint: suspect.mint,
+      symbol: suspect.symbol,
+      name: suspect.name,
+      similarity: suspect.similarity,
+      matchedOn: suspect.matchedOn,
+      rosterBuys: suspect.rosterBuyers.size,
+      rosterWallets: [...suspect.rosterBuyers],
+      tradesPerMin: reading.tradesPerMin,
+      priceSol: reading.priceSol,
+      firstSeenAt: suspect.firstSeenAt,
+    });
+  }
+  return PositionStateSchema.parse({
+    mint: watch.mint,
+    meta: watch.meta,
+    openedAt: watch.openedAt,
+    expiresAt: watch.expiresAt,
+    entrySolLamports: watch.entrySolLamports,
+    // Ranked by what matters: tracked buyers first, then how hard it is
+    // trading. The screen draws the top few and counts the rest.
+    clones: clones.sort((a, b) => b.rosterBuys - a.rosterBuys || b.tradesPerMin - a.tradesPerMin),
+    alerted: extras.alerted,
+    score: extras.score,
+    closed: extras.closed,
+    closeReason: extras.closeReason,
+  });
+}
+
+/** Score per position once it has alerted, so a republished panel stays loud. */
+const alerted = new Map<string, number>();
+
+/**
+ * Publish the panel for one position.
+ *
+ * `watch` is passed in rather than looked up, because the most important call
+ * happens as a watch closes, when it is already gone from the map. Without that
+ * frame the panel would stay on screen forever.
+ */
+async function publishPosition(watch: Watch, closeReason: WatchCloseReason | null = null): Promise<void> {
+  try {
+    const score = alerted.get(watch.mint);
+    const state = await positionStateOf(watch, {
+      alerted: score !== undefined,
+      score: score ?? null,
+      closed: closeReason !== null,
+      closeReason,
+    });
+    await redis.publish(CHANNELS.positions, JSON.stringify(state));
+  } catch (error) {
+    logger.error({ mint: watch.mint, err: String(error) }, "could not publish position state");
+  }
+}
+
+/** Look a watch up by mint, for the paths that only have one. */
+const watchOf = (mint: string): Watch | undefined =>
+  watches.list().find((w) => w.mint === mint);
+
 async function publishMonitored(): Promise<void> {
   const wanted = new Set<string>();
   for (const watch of watches.list()) {
@@ -193,6 +274,7 @@ const stats = {
   rosterBuys: 0,
   alerts: 0,
   suppressed: 0,
+  ticks: 0,
 };
 
 /**
@@ -214,6 +296,8 @@ async function describe(mint: string, openedAt: number): Promise<void> {
     }
     if (!watches.describe(mint, meta)) return; // closed while we were resolving
     stats.narrativesResolved += 1;
+    const described = watchOf(mint);
+    if (described !== undefined) void publishPosition(described);
     logger.info({ mint, symbol: meta.symbol, name: meta.name }, "NARRATIVE");
   } catch (error) {
     stats.narrativesUnresolved += 1;
@@ -237,6 +321,7 @@ async function considerAlert(trade: TradeEvent): Promise<void> {
 
   watches.recordRosterBuy(trade.mint, trade.trader);
   stats.rosterBuys += 1;
+  void publishPosition(watch);
 
   const buyers = new Set<string>();
   for (const suspect of watch.suspects.values()) {
@@ -295,6 +380,8 @@ async function considerAlert(trade: TradeEvent): Promise<void> {
     thresholds: thresholds.current,
   });
   await redis.publish(CHANNELS.alerts, JSON.stringify(alert));
+  alerted.set(watch.mint, alert.score);
+  await publishPosition(watch);
   stats.alerts += 1;
   logger.warn(
     {
@@ -346,6 +433,7 @@ function matchLaunch(launch: MintEvent): void {
     if (!isNew) continue;
     stats.clonesFound += 1;
     void publishMonitored();
+    void publishPosition(watch);
     logger.warn(
       {
         parent: watch.meta.symbol,
@@ -418,11 +506,11 @@ const sweeper = setInterval(() => watches.sweep(Date.now()), 5_000);
 sweeper.unref();
 
 /**
- * Report flow for everything currently monitored.
+ * Publish a tick for everything monitored, and log it.
  *
- * Deliberately a log line rather than a PanelTick: PanelTick requires a score
- * and nothing has computed one yet. Emitting it with a placeholder would be the
- * same mistake as fabricating an AlertPayload at step 2.
+ * Step 4 deliberately withheld ticks because the old shape demanded a score
+ * nothing had computed. The shape no longer asks for one — score belongs to the
+ * position — so these are now honest.
  */
 const reporter = setInterval(() => {
   void (async () => {
@@ -431,6 +519,14 @@ const reporter = setInterval(() => {
       const rows = [watch.mint, ...watch.suspects.keys()];
       for (const mint of rows) {
         const reading = await flow.read(mint, now);
+        await redis.publish(CHANNELS.ticks, JSON.stringify({
+          mint,
+          observedAt: now,
+          priceSol: reading.priceSol,
+          tradesPerMin: reading.tradesPerMin,
+          estimatedVolumeSolPerMin: reading.estimatedVolumeSolPerMin,
+        }));
+        stats.ticks += 1;
         if (reading.tradesPerMin === 0 && reading.priceSol === null) continue;
         const suspect = watch.suspects.get(mint);
         logger.info(
@@ -452,7 +548,7 @@ const reporter = setInterval(() => {
       }
     }
   })().catch((error: unknown) => logger.debug({ err: String(error) }, "flow report failed"));
-}, 10_000);
+}, thresholds.current.monitor.tick_interval_ms);
 reporter.unref();
 
 const heartbeat = setInterval(() => {
@@ -492,6 +588,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
 logger.info(
   {
     channels: [CHANNELS.trades, CHANNELS.mints, CHANNELS.activity],
+    publishes: [CHANNELS.positions, CHANNELS.ticks, CHANNELS.alerts],
     wallet,
     windowSeconds: thresholds.current.watch.window_seconds,
     minSimilarity: thresholds.current.narrative.min_similarity,

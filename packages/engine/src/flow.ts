@@ -20,7 +20,7 @@
  */
 import { KEYS, type Address, type MintActivity, type TradeEvent } from "@argus/shared";
 import { decodeTrade, encodeTrade, type Windows } from "./windows.js";
-import { priceSolOf } from "./ticks.js";
+import { priceSolOf } from "./price.js";
 
 export interface FlowReading {
   mint: Address;

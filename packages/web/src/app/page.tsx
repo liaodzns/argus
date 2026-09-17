@@ -1,41 +1,72 @@
 "use client";
 
-import { ChartPanel } from "../components/ChartPanel";
+import { useEffect, useState } from "react";
+import { PositionPanel } from "../components/PositionPanel";
 import { useAlertSocket } from "../hooks/useAlertSocket";
 
 const WS_URL = process.env["NEXT_PUBLIC_WS_URL"] ?? "ws://localhost:8080/ws";
 
-/**
- * One panel, which is the whole of step 5. The wall, with ordering, eviction
- * and pinning, is step 8.
- */
 export default function Page() {
-  const { status, alerts, ticks, evaluated } = useAlertSocket(WS_URL);
-  const alert = alerts[0];
+  const { status, positions, history, rates, ticks } = useAlertSocket(WS_URL);
+
+  // The countdown on each panel has to move, and nothing else on the page does.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Alerted positions first: if two things are open, the one being taken is
+  // the one you need to look at.
+  const open = Object.values(positions).sort(
+    (a, b) => Number(b.alerted) - Number(a.alerted) || a.openedAt - b.openedAt,
+  );
 
   return (
-    <main style={{ maxWidth: 720, margin: "0 auto", padding: "32px 20px" }}>
-      <header style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 20 }}>
-        <h1 style={{ fontSize: 15, fontWeight: 600, margin: 0, letterSpacing: 0.2 }}>Argus</h1>
-        <span style={{ fontSize: 11, color: status === "open" ? "#3fb950" : "#8b949e" }}>
-          {status === "open" ? "Watching" : status === "connecting" ? "Connecting" : "Reconnecting"}
+    <main style={{ maxWidth: 620, margin: "0 auto", padding: "28px 18px 48px" }}>
+      <header style={S.header}>
+        <h1 style={S.title}>Argus</h1>
+        <span style={{ ...S.status, color: status === "open" ? "#3fb950" : "#8b949e" }}>
+          {status === "open" ? "Connected" : status === "connecting" ? "Connecting" : "Reconnecting"}
         </span>
       </header>
 
-      {alert === undefined ? (
-        <section style={{ border: "1px dashed #1b2029", borderRadius: 6, padding: "48px 24px", textAlign: "center" }}>
-          <p style={{ margin: "0 0 6px", fontSize: 13, color: "#e6edf3" }}>
-            Watching every new pump.fun token for volume acceleration and wallets you follow.
+      {open.length === 0 ? (
+        <section style={S.empty}>
+          <p style={S.emptyLead}>
+            Watching your wallet. A panel opens here the moment you buy.
           </p>
-          <p style={{ margin: 0, fontSize: 12, color: "#6e7681" }}>
-            {evaluated === 0
-              ? "Nothing has crossed the threshold yet. A panel opens here the moment something does."
-              : `${evaluated} events evaluated. A panel opens here the moment something crosses.`}
+          <p style={S.emptyBody}>
+            Every new pump.fun launch is then checked against what you hold, and if tracked
+            wallets start buying a clone of it, this panel says so.
+          </p>
+          <p style={S.emptyFoot}>
+            {ticks === 0 ? "Nothing being monitored right now." : `${ticks} updates received.`}
           </p>
         </section>
       ) : (
-        <ChartPanel alert={alert} tick={ticks[alert.mint]} />
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          {open.map((position) => (
+            <PositionPanel
+              key={position.mint}
+              position={position}
+              history={history}
+              rates={rates}
+              now={now}
+            />
+          ))}
+        </div>
       )}
     </main>
   );
 }
+
+const S: Record<string, React.CSSProperties> = {
+  header: { display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 18 },
+  title: { fontSize: 15, fontWeight: 600, margin: 0, letterSpacing: 0.2 },
+  status: { fontSize: 11 },
+  empty: { border: "1px dashed #1b2029", borderRadius: 8, padding: "40px 24px", textAlign: "center" },
+  emptyLead: { margin: "0 0 8px", fontSize: 13, color: "#e6edf3" },
+  emptyBody: { margin: "0 0 14px", fontSize: 12, color: "#8b949e", lineHeight: 1.5, maxWidth: 400, marginLeft: "auto", marginRight: "auto" },
+  emptyFoot: { margin: 0, fontSize: 11, color: "#6e7681" },
+};
