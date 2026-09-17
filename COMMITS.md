@@ -9,6 +9,135 @@ several defects are squashed into one commit message.
 
 ---
 
+## Change set: step 4, price and flow
+
+**Branch:** `feat/v2-price-and-flow` · **Base:** `1410b91` (step 3 merged)
+
+**Context.** Clones are now identified but nothing measures whether one is
+taking money. Step 4 adds that, for a parent that may be pre-bond or post-bond
+and a clone that is always pre-bond, as one mechanism rather than two.
+
+**The shape change.** The plan called for reading bonding curve accounts. That
+is abandoned: PumpSwap's pool holds no reserves (they sit in separate vaults, so
+no byte offsets reproduced its price across three tokens), and the curve's
+values did not reconcile with the creation feed's own figures. Monitoring now
+keys on the **mint**, which never changes when a token bonds, so pre-bond and
+post-bond are the same code path with no switchover.
+
+| Gate check | Result |
+|---|---|
+| Concurrent subscriptions on one socket | 30 of 30 confirmed |
+| Post-bond price vs DexScreener | 1.8% apart |
+| Pre-bond price, stable | 4 to 13% apart |
+| Independently decoded buy vs sell, same moment | agree to 0.5% |
+| Sampling ceiling held | 16 samples in 60s against a ~30 allowance |
+| Control loop restart recovery | recovered correct mint from the set alone |
+| Stranger's sell closing a watch | did not |
+
+**Diff:** 14 files, +418 / −47, plus two new source files.
+
+---
+
+### 1. `feat(shared): add MintActivity for free flow monitoring`
+
+A new `StreamEvent` kind carrying mint, signature, landed and `observedAt`, on a
+new `CHANNELS.activity`. Plus `KEYS.activityWindow` and `KEYS.monitored`.
+
+It deliberately carries no amount and no direction, because neither is readable
+from a log notification. One mint surfaced seventeen distinct trade instruction
+names plus aggregator traffic where a `Swap` could go either way.
+
+The slot cursor in the publisher becomes an allow-list of chain-derived kinds
+rather than a deny-list, so the next slotless event is excluded by default
+instead of breaking it. The type checker found that, and the replay recorder,
+both at compile time.
+
+**Files.** `packages/shared/src/events.ts`, `packages/ingest/src/publish.ts`,
+`scripts/replay.ts`.
+
+---
+
+### 2. `feat(ingest): monitor price and flow by mint, on both venues`
+
+One log subscription per monitored mint, driven by a Redis set the engine writes
+and this polls. Free notifications forwarded as activity; decoding rate-limited
+to one sample per mint per interval, spent on the busiest mints rather than the
+first seen, because during a wave the dangerous clone is whichever is taking
+volume and you cannot know which without watching for free first.
+
+Carries forward both lessons from step 1: the sample fetch matches the
+subscription's commitment, and a rejected subscription is counted rather than
+looking identical to a quiet mint.
+
+**Files.** `packages/ingest/src/streams/monitor.ts`,
+`packages/ingest/src/main.ts`, `config/thresholds.yml`,
+`packages/shared/src/config.ts`.
+
+---
+
+### 3. `feat(engine): aggregate flow and publish the monitored set`
+
+Per-mint readings: exact trades per minute, landed ratio, latest sampled price,
+and an estimated volume that is labelled an estimate everywhere it appears
+because it is sampled size times rate, not a sum.
+
+The monitored set is rewritten in full and swapped in by renaming a temp key, so
+ingest never observes a half-written set and a missed delta cannot leave a stale
+subscription alive.
+
+Activity and sampled trades go in **separate windows** on different clocks,
+arrival versus block time, and a count from one is never compared against the
+other. That conflation is what broke the cooldown at step 6.
+
+**Files.** `packages/engine/src/flow.ts`, `packages/engine/src/main.ts`.
+
+---
+
+### 4. `feat(engine): hold suspects on a watch and guard observe() on the wallet`
+
+Watches carry the clones found against them, which is what the monitored set is
+built from. Market trades now share a channel with your own fills, so
+`createWatches` takes the watched wallet and `observe()` refuses anything else.
+
+The guard lives in the module rather than at the call site deliberately: the
+failure it prevents is a stranger's sell closing your watch, which means missing
+a vamp. Verified it holds.
+
+**Files.** `packages/engine/src/watches.ts`.
+
+---
+
+### 5. `chore(engine): drop fastest-levenshtein`
+
+Unused since step 3 hand-rolled Jaro-Winkler rather than adding a dependency.
+
+**Files.** `packages/engine/package.json`.
+
+---
+
+### 6. `docs: record step 4 and why DexScreener is not ground truth`
+
+The pre-bond price looked 23% wrong and was not. Buys and sells were both biased
+the same direction, which ruled out slippage, and a full delta dump showed the
+decoder reading exactly what moved. A hundred-second series then showed
+DexScreener reporting an identical value across three windows while the real
+fill price halved.
+
+The lesson is about the gate rather than the code: "tracks an independent chart"
+is only meaningful while that chart is fresh, and it is least fresh exactly when
+a token is moving, which is the only time this tool runs.
+
+**Files.** `NOTES.md`, `PIVOT.md`, `COMMITS.md`.
+
+---
+
+### Suggested order
+
+1 → 2 → 3 → 4 → 5 → 6. Contract, then the producer, then the consumer, then the
+guard that the consumer needs. Each typechecks alone.
+
+---
+
 ## Change set: step 3, narrative capture and clone matching
 
 **Branch:** `feat/v2-narrative-matching` · **Base:** step 2

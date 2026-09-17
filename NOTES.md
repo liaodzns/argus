@@ -407,6 +407,87 @@ reflects on sniper wallets and on my test design, not on the roster.
 This is the one place v2 spends real money — see the cost note in `PIVOT.md`
 section 4 — so it is the first number to measure.
 
+### v2 step 4 — Price and flow, both venues (2026-09-17)
+
+The parent is usually already migrated: three of the four tokens seen in the
+operator's wallet traded on PumpSwap, one on the bonding curve. Clones are
+always minutes old and so always pre-bond. The requirement was one mechanism
+covering both, not two subsystems.
+
+**Reading account layouts is abandoned.** Two measured dead ends. PumpSwap's
+pool account is 301 bytes and holds no reserves at all, they live in separate
+vault accounts, which is why no pair of byte offsets reproduced its price across
+three tokens. And the bonding curve's reserve values did not reconcile with the
+creation feed's own reported figures, most likely because mayhem-mode launches
+use different curve parameters. Guessing at either yields a confident chart at
+the wrong magnitude.
+
+**What replaced it: `logsSubscribe { mentions: [mint] }`.** Venue-agnostic by
+construction, because the mint never changes while the curve and the pool do.
+The same subscription follows a token across bonding with no switchover logic at
+all, which satisfies the requirement structurally rather than by handling two
+cases. Verified on a post-bond token: 360 notifications, 317 landed, 45 seconds,
+zero `getTransaction` calls. One socket holds 30 concurrent subscriptions, which
+matters because a wave produces 25 suspects.
+
+**Two tiers.** Free activity counting gives exact trade rate and landed ratio.
+Rate-limited decoding gives price and an estimated volume. A hot token does ~7
+landed trades a second, so decoding everything during a 25-clone wave would need
+hundreds of calls a second and fall behind precisely when it matters.
+
+**Direction is not free.** One mint surfaced seventeen distinct trade
+instruction names, including `Swap2`, `BuyV2` and `SellPumpSwapExactQuoteOut`,
+plus Jupiter and Meteora traffic where a `Swap` could go either way. Counting
+`Buy` and `Sell` log lines would silently miss most of the volume. Third
+independent confirmation that balance-delta decoding is the only honest route.
+
+### The gate, and why DexScreener is not ground truth
+
+| Case | Result |
+|---|---|
+| Post-bond token vs DexScreener | 1.8% apart |
+| Pre-bond token, stable price | 4 to 13% apart |
+| Pre-bond token, fast move | DexScreener froze, we tracked it |
+
+The pre-bond token initially looked 23% wrong. It was not. Buys averaged 20.1%
+above DexScreener's mid and sells 20.8% above, both in the same direction, which
+rules out slippage. Dumping one buy and one sell in full showed the decoder
+reading exactly what moved, and the two independently computed fill prices
+agreed with each other to 0.5% while sitting 46% above DexScreener.
+
+Then a hundred-second time series settled it: DexScreener reported the identical
+value, 1.1610e-7, for three consecutive twenty-second windows while the real
+fill price halved from 1.04e-7 to 6.05e-8. It had stopped updating.
+
+The lesson is about the gate criterion rather than the code. "Price tracks an
+independent chart" is only meaningful when the chart is fresh, and it is least
+fresh exactly when a token is moving, which is the only time this tool runs. The
+stronger check is internal: a buy and a sell decoded independently at the same
+moment must agree, and they do to within 0.5%.
+
+### Other findings
+
+**The engine owns the monitored set; ingest polls it.** A Redis set rather than
+a control channel, replaced atomically via a temp key and rename so ingest never
+sees a half-written set. Verified: mints picked up and dropped live, and a
+restarted ingest recovered the correct subscription from the set alone with no
+re-announce.
+
+**A structural guard, not a conditional one.** Market trades now share a channel
+with the operator's own fills, so `createWatches` takes the watched wallet and
+`observe()` refuses anything else. Verified that a stranger selling the held
+token leaves the watch open. Putting the check inside the module rather than at
+the call site matters because wrongly closing a watch means missing a vamp.
+
+**Two clocks, kept in separate windows.** Activity carries arrival wall clock
+because a notification has no chain timestamp; sampled trades carry real block
+time. They never share a window and a count from one is never compared against
+the other. That conflation is what broke the cooldown at step 6.
+
+**No `PanelTick` yet.** It requires a score, and nothing has computed one. A
+placeholder would repeat the fabricated-`AlertPayload` mistake avoided at
+step 2.
+
 ### v2 step 3 — Narrative capture and clone matching (2026-09-17)
 
 Gate passed against a **real recorded vamp wave**, kept as

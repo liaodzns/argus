@@ -116,10 +116,14 @@ export function createPublisher(options: PublisherOptions) {
 
     publish(event: StreamEvent): void {
       buffer.push([channelForEvent(event), JSON.stringify(event)]);
-      // The cursor records chain position, and a launch has none: the creation
-      // feed reports when we heard about a mint, not which slot confirmed it.
-      // Advancing the cursor from an observation timestamp would corrupt it.
-      if (event.kind !== "mint") pendingSlot = Math.max(pendingSlot, event.slot);
+      // The cursor records chain position, so only chain-derived events may
+      // advance it. Launches and activity notifications report when we heard
+      // about something, not which slot confirmed it, and advancing a cursor
+      // from an observation timestamp would corrupt it. Stated as an allow-list
+      // so a future slotless event kind is excluded by default.
+      if (event.kind === "trade" || event.kind === "migration") {
+        pendingSlot = Math.max(pendingSlot, event.slot);
+      }
       stats.bufferDepth = buffer.length;
 
       if (buffer.length >= warnDepth && buffer.length >= warnedAtDepth * 2) {

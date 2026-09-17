@@ -123,12 +123,35 @@ that spawned before the buy landed. Carrying a rolling window of recent
 creations to cover that case costs more than the case is worth.
 *Cost: free. No key, no RPC, no image fetching.*
 
-**5. Watch the suspects, and your own token.** For each matched mint,
-`accountSubscribe` to its bonding curve account. Every trade against that curve
-pushes updated reserves. Price is `virtualSolReserves / virtualTokenReserves`;
-the change in `virtualSolReserves` over a window is net SOL flow.
-*Cost: free. Verified 2026-09-17: 90 pushes across 3 curves in 25 seconds, zero
-`getTransaction` calls.*
+**5. Watch the suspects, and your own token.** One
+`logsSubscribe { mentions: [mint] }` per monitored token, which is
+venue-agnostic by construction: the mint never changes while the bonding curve
+and the AMM pool do, so the same subscription follows a token across bonding
+with no switchover logic. Pre-bond and post-bond are therefore one mechanism,
+not two.
+
+This replaced an attempt to read reserves out of the curve and pool accounts.
+PumpSwap's pool account holds no reserves at all, they live in separate vaults,
+and the curve's values did not reconcile with the creation feed's own figures.
+Guessing at either layout produces a confident chart at the wrong magnitude.
+
+Two tiers, because they cost very differently:
+
+- **Free.** Every notification forwarded as `MintActivity`. Exact trade count
+  and landed ratio, no RPC calls, identical on both venues. Verified: 360
+  notifications over 45 seconds on a post-bond token, zero `getTransaction`.
+- **Paid, rate-limited.** One decoded trade per mint per
+  `monitor.price_sample_ms`, giving price and an estimated SOL volume. A hot
+  clone does ~7 landed trades a second, so decoding everything during a wave
+  would need hundreds of calls a second and fall behind exactly when it matters.
+
+Direction is not free either: one mint surfaced seventeen different trade
+instruction names plus aggregator traffic where a `Swap` could go either way, so
+counting `Buy` and `Sell` log lines would miss most of the volume.
+
+Which mints to hold is decided by the engine, which writes a set to Redis that
+ingest polls and diffs. No control channel, no re-announce protocol, and either
+process can restart without intervention.
 
 **6. Ask who is buying the suspect.** `logsSubscribe { mentions: [suspectMint] }`
 and decode each trade, matching the buyer against the roster in
@@ -246,6 +269,9 @@ way. There is nothing to gain.
   leftover. Volume is confirmation, and its exact threshold stays deferred.
 - **No persistence and no restart recovery.** A watch is a timer, not a
   position. The operator closes out and monitors longer holds elsewhere.
+- **Monitoring keys on the mint, never on a venue account.** That is what makes
+  pre-bond and post-bond one mechanism. Reading curve or pool layouts is
+  abandoned; see stage 5.
 - **The watch window is `watch.window_seconds`**, default 180. Short by nature,
   with margin because closing early is the expensive direction.
 - **Matching is `narrative.min_similarity`**, default 0.90, and
@@ -258,7 +284,11 @@ way. There is nothing to gain.
 
 **Still open.**
 
-**What happens when your token migrates?** Once the bonding curve completes,
+**What happens when your token migrates?** Settled: nothing. Monitoring keys on
+the mint, which does not change when a token bonds, so there is no switchover to
+get wrong. Unverified only because a token bonding mid-watch cannot be summoned.
+
+**Superseded question:** Once the bonding curve completes,
 liquidity moves to PumpSwap and the curve account stops being the price source.
 A migrated position needs a different reader. Vamps themselves are always fresh,
 so they stay on the curve.
@@ -300,9 +330,10 @@ Each step keeps a verification gate. Same discipline as before.
 3. **Narrative capture and the new-mint feed.** From your buy forward, match new
    creations against the position and log the matches.
    *Gate:* a same-ticker redeploy spawned after your buy is identified.
-4. **Bonding curve monitoring.** Subscribe to your token and its suspects,
-   derive price and net flow.
-   *Gate:* prices track an independent chart for both.
+4. **Price and flow.** One log subscription per mint, free activity counting
+   plus rate-limited price sampling, covering pre-bond and post-bond alike.
+   *Gate:* price agrees with an independent source, and independently decoded
+   buys and sells agree with each other at the same moment.
 5. **The alert.** Roster buys on a suspect, with volume as confirmation.
    *Gate:* a recorded vamp wave fires; a quiet same-name collision does not.
 6. **The panel.** Your position against its suspects, one screen, Axiom link.

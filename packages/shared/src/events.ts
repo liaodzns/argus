@@ -117,10 +117,38 @@ export const MigrationEventSchema = z.object({
 });
 export type MigrationEvent = z.infer<typeof MigrationEventSchema>;
 
+/**
+ * A transaction touched a mint we are watching.
+ *
+ * This is the free tier of price and flow monitoring: a log notification
+ * forwarded as-is, with no transaction fetched. It gives an exact trade count
+ * and the landed-versus-failed ratio for any token, on the bonding curve or on
+ * the AMM, because it keys on the mint rather than on a venue-specific account.
+ *
+ * It deliberately carries no amount and no direction. Neither is readable from
+ * a log notification: one sampled mint surfaced seventeen different trade
+ * instruction names plus aggregator traffic where a `Swap` could go either way,
+ * so counting `Buy` and `Sell` lines would miss most of the volume. Amounts and
+ * direction require a decode, which is the paid tier.
+ *
+ * `observedAt` is arrival wall clock, like `MintEvent.observedAt`, because a
+ * notification has no chain timestamp. It must never share a rolling window
+ * with block-time events.
+ */
+export const MintActivitySchema = z.object({
+  kind: z.literal("activity"),
+  mint: AddressSchema,
+  signature: SignatureSchema,
+  landed: z.boolean(),
+  observedAt: TimestampSchema,
+});
+export type MintActivity = z.infer<typeof MintActivitySchema>;
+
 export const StreamEventSchema = z.discriminatedUnion("kind", [
   TradeEventSchema,
   MintEventSchema,
   MigrationEventSchema,
+  MintActivitySchema,
 ]);
 export type StreamEvent = z.infer<typeof StreamEventSchema>;
 
@@ -264,6 +292,7 @@ export const CHANNELS = {
   trades: "argus:stream:trades",
   mints: "argus:stream:mints",
   migrations: "argus:stream:migrations",
+  activity: "argus:stream:activity",
   alerts: "argus:alerts",
   ticks: "argus:ticks",
 } as const;
@@ -284,8 +313,16 @@ export type ChannelName = (typeof CHANNELS)[keyof typeof CHANNELS];
  * replays a mixed stream has to go through here rather than reaching for
  * `blockTime` and quietly excluding launches.
  */
-export const eventTime = (event: StreamEvent): Timestamp =>
-  event.kind === "mint" ? event.observedAt : event.blockTime;
+export const eventTime = (event: StreamEvent): Timestamp => {
+  switch (event.kind) {
+    case "mint":
+    case "activity":
+      return event.observedAt;
+    case "trade":
+    case "migration":
+      return event.blockTime;
+  }
+};
 
 export const channelForEvent = (event: StreamEvent): ChannelName => {
   switch (event.kind) {
@@ -295,6 +332,8 @@ export const channelForEvent = (event: StreamEvent): ChannelName => {
       return CHANNELS.mints;
     case "migration":
       return CHANNELS.migrations;
+    case "activity":
+      return CHANNELS.activity;
   }
 };
 
@@ -309,6 +348,14 @@ export const KEYS = {
   tradeWindow: (mint: Address) => `argus:w:trades:${mint}`,
   /** zset, score = blockTime, member = buyer address. */
   buyerWindow: (mint: Address) => `argus:w:buyers:${mint}`,
+  /**
+   * zset, score = **arrival** time, member = signature.
+   *
+   * Scored by a different clock to every other window here, because a log
+   * notification has no chain timestamp. Never compare a count from this window
+   * against one from a block-time window.
+   */
+  activityWindow: (mint: Address) => `argus:w:activity:${mint}`,
   /** zset, score = blockTime, member = KOL address. */
   kolWindow: (mint: Address) => `argus:w:kols:${mint}`,
   tokenMeta: (mint: Address) => `argus:meta:${mint}`,
@@ -319,4 +366,12 @@ export const KEYS = {
   /** Last emitted score, for the escalation-delta check. */
   lastScore: (mint: Address) => `argus:score:${mint}`,
   slotCursor: (source: string) => `argus:cursor:${source}`,
+  /**
+   * Set of mints ingest should hold log subscriptions for.
+   *
+   * The engine owns the contents, ingest polls and diffs. Being a set rather
+   * than a message stream makes it idempotent and lets either process restart
+   * without a re-announce protocol.
+   */
+  monitored: () => "argus:monitored",
 } as const;
