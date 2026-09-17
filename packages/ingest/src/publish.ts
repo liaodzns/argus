@@ -9,7 +9,7 @@
  */
 import type { Redis } from "ioredis";
 import type { Logger } from "pino";
-import { CHANNELS, KEYS, type StreamEvent } from "@argus/shared";
+import { KEYS, channelForEvent, type StreamEvent } from "@argus/shared";
 
 export interface PublisherStats {
   published: number;
@@ -39,17 +39,6 @@ export interface PublisherOptions {
    *  failure rather than waited on indefinitely. */
   flushTimeoutMs?: number;
 }
-
-const channelFor = (event: StreamEvent): string => {
-  switch (event.kind) {
-    case "trade":
-      return CHANNELS.trades;
-    case "mint":
-      return CHANNELS.mints;
-    case "migration":
-      return CHANNELS.migrations;
-  }
-};
 
 export function createPublisher(options: PublisherOptions) {
   const { redis, logger, source } = options;
@@ -126,7 +115,7 @@ export function createPublisher(options: PublisherOptions) {
     stats,
 
     publish(event: StreamEvent): void {
-      buffer.push([channelFor(event), JSON.stringify(event)]);
+      buffer.push([channelForEvent(event), JSON.stringify(event)]);
       pendingSlot = Math.max(pendingSlot, event.slot);
       stats.bufferDepth = buffer.length;
 

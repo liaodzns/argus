@@ -16,7 +16,7 @@ import { createPublisher } from "./publish.js";
 // nothing about which variable they forgot to set.
 function readEnv(): ReturnType<typeof loadEnv> {
   try {
-    return loadEnv();
+    return loadEnv(process.env, { requireChainSource: true });
   } catch (error) {
     if (error instanceof ZodError) {
       process.stderr.write("Invalid environment. Copy .env.example to .env and fill in:\n");

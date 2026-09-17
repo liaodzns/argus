@@ -87,16 +87,33 @@ export function buildAlert(input: AlertInput): AlertPayload {
 /**
  * Minimal per-mint cooldown, so one token cannot crowd out the wall.
  *
- * SET NX EX is the whole mechanism: whoever sets the key owns the next window.
+ * Measured in block time, like every window in this system, rather than as a
+ * Redis TTL. A wall-clock cooldown disagrees with a block-time window the
+ * moment the two clocks diverge, which is every replay and every minute the
+ * engine spends behind the stream. Replaying a session at 4x would expire a
+ * five-minute cooldown after seventy-five seconds of events and produce alerts
+ * the live run never emitted.
+ *
+ * The key still carries a TTL, but only so a dead mint's key is reclaimed. It
+ * is deliberately far longer than the cooldown and never decides anything.
+ *
+ * Read-then-write is safe here because the engine serialises work per mint;
+ * this is the only writer for a given key at a given time.
+ *
  * The escalation override, where a big enough score jump re-alerts inside the
- * cooldown, is part of the suppression work at step 7 and is deliberately not
- * guessed at here.
+ * cooldown, is part of the suppression work at step 7 and is not guessed at
+ * here.
  */
 export async function claimAlertSlot(
   redis: Redis,
   mint: string,
+  blockTime: Timestamp,
   cooldownSeconds: number,
 ): Promise<boolean> {
-  const result = await redis.set(KEYS.cooldown(mint), "1", "EX", cooldownSeconds, "NX");
-  return result === "OK";
+  const key = KEYS.cooldown(mint);
+  const existing = await redis.get(key);
+  if (existing !== null && Number(existing) > blockTime) return false;
+  const expiresAt = blockTime + cooldownSeconds * 1000;
+  await redis.set(key, String(expiresAt), "EX", cooldownSeconds * 8);
+  return true;
 }
