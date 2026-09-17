@@ -80,9 +80,23 @@ on your transactions, a few dozen a day. Decode with the existing balance-delta
 decoder to get mint, side and size.
 *Cost: one `getTransaction` per trade you make.*
 
-**2. Open a position.** A buy opens a watch on that mint. A sell closes it.
-Narratives are only tracked for open positions, so the work is bounded by how
-many tokens you hold, not by how many exist.
+**2. Open a watch, in memory.** A buy opens a watch on that mint. Your sell
+closes it, and so does the window expiring.
+
+Nothing is persisted and nothing is reconciled against on-chain balances. The
+operator closes out of positions, and has other tools for anything held longer
+than an hour, so a watch is a short-lived timer rather than a durable position.
+A restart losing its watches is acceptable: the risk window it was covering has
+passed anyway.
+
+This deletes a whole category of work — balance reads, token account
+subscriptions, dust thresholds, restart reconciliation — that only pays off for
+holds this tool is not for.
+
+The window length is `watch.window_seconds` in `config/thresholds.yml`, hot
+reloaded, defaulting to three minutes. Expiry is swept on a five-second tick, so
+a watch closes within that of its deadline; against a window measured in minutes
+the granularity does not matter.
 
 **3. Capture the narrative.** Name, symbol, and image for the token you bought.
 *Cost: one metadata lookup, cached.*
@@ -219,6 +233,10 @@ way. There is nothing to gain.
   the first few minutes after the buy, not the whole holding period.
 - **The roster stays.** It is the primary signal on a suspect, not a v1
   leftover. Volume is confirmation, and its exact threshold stays deferred.
+- **No persistence and no restart recovery.** A watch is a timer, not a
+  position. The operator closes out and monitors longer holds elsewhere.
+- **The watch window is `watch.window_seconds`**, default 180. Short by nature,
+  with margin because closing early is the expensive direction.
 
 **Still open.**
 
@@ -257,8 +275,10 @@ Each step keeps a verification gate. Same discipline as before.
 
 1. **Watch the wallet.** Subscribe, decode your own fills, print them.
    *Gate:* you buy something, it appears in the terminal within seconds.
-2. **Positions.** Open on buy, close on sell, survive a restart.
-   *Gate:* holdings match your wallet after a restart.
+2. **Watches.** Open on buy, close on your sell or on the window expiring.
+   In memory, no persistence.
+   *Gate:* a buy opens a watch in the log, a sell closes it, and an untouched
+   watch closes itself when the window runs out.
 3. **Narrative capture and the new-mint feed.** From your buy forward, match new
    creations against the position and log the matches.
    *Gate:* a same-ticker redeploy spawned after your buy is identified.
