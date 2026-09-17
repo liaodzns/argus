@@ -287,16 +287,59 @@ export const AlertPayloadSchema = z.object({
 });
 export type AlertPayload = z.infer<typeof AlertPayloadSchema>;
 
-/** High frequency — this is the bulk of socket traffic. Keep it small. */
+/**
+ * High frequency — the bulk of socket traffic. Keep it small.
+ *
+ * Reshaped from v1, which promised `buyers1m` that nothing counts and
+ * `volumeSol1m` as though it were exact. Trade rate is exact and free; the
+ * volume figure is sampled size times rate and is named an estimate so nobody
+ * downstream mistakes it for a sum.
+ *
+ * `score` is gone: a clone does not have one, and it belongs to the position.
+ * `observedAt` replaces `blockTime` because the rate comes from the
+ * arrival-stamped activity window, not from chain time.
+ */
 export const PanelTickSchema = z.object({
   mint: AddressSchema,
-  blockTime: TimestampSchema,
-  priceSol: z.number().nonnegative(),
-  volumeSol1m: z.number().nonnegative(),
-  buyers1m: z.number().int().nonnegative(),
-  score: z.number().min(0).max(100),
+  observedAt: TimestampSchema,
+  /** Null until a trade on this mint has been decoded. */
+  priceSol: z.number().nonnegative().nullable(),
+  tradesPerMin: z.number().nonnegative(),
+  estimatedVolumeSolPerMin: z.number().nonnegative().nullable(),
 });
 export type PanelTick = z.infer<typeof PanelTickSchema>;
+
+export const WatchCloseReasonSchema = z.enum(["sold", "expired"]);
+export type WatchCloseReasonName = z.infer<typeof WatchCloseReasonSchema>;
+
+/**
+ * Everything a panel draws, republished whenever it changes.
+ *
+ * The screen has to exist before any alert does — it opens when you buy, so you
+ * can see the watch is live rather than wondering whether the tool is running.
+ * Alerts alone therefore cannot drive it.
+ *
+ * This overlaps `AlertPayload` on purpose, and the distinction is worth keeping:
+ * this is a live view model the browser re-renders from, while an AlertPayload
+ * is the durable record of something that happened. Collapsing them would force
+ * either the browser to rebuild state from a stream of events, or the record to
+ * carry view concerns it has no business knowing about.
+ */
+export const PositionStateSchema = z.object({
+  mint: AddressSchema,
+  /** Null while enrichment is still resolving what you bought. */
+  meta: TokenMetaSchema.nullable(),
+  openedAt: TimestampSchema,
+  expiresAt: TimestampSchema,
+  entrySolLamports: z.number().int().nonnegative(),
+  clones: z.array(CloneSchema),
+  alerted: z.boolean(),
+  /** Null until an alert fires. Never a placeholder. */
+  score: z.number().min(0).max(100).nullable(),
+  closed: z.boolean(),
+  closeReason: WatchCloseReasonSchema.nullable(),
+});
+export type PositionState = z.infer<typeof PositionStateSchema>;
 
 // --- Socket frames ----------------------------------------------------------
 
@@ -309,7 +352,7 @@ export type PanelTick = z.infer<typeof PanelTickSchema>;
  * everything else here.
  */
 export const ServerFrameSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("alert"), data: AlertPayloadSchema }),
+  z.object({ type: z.literal("position"), data: PositionStateSchema }),
   z.object({ type: z.literal("tick"), data: PanelTickSchema }),
 ]);
 export type ServerFrame = z.infer<typeof ServerFrameSchema>;
@@ -323,6 +366,7 @@ export const CHANNELS = {
   migrations: "argus:stream:migrations",
   activity: "argus:stream:activity",
   alerts: "argus:alerts",
+  positions: "argus:positions",
   ticks: "argus:ticks",
 } as const;
 export type ChannelName = (typeof CHANNELS)[keyof typeof CHANNELS];
