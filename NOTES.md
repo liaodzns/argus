@@ -407,6 +407,117 @@ reflects on sniper wallets and on my test design, not on the roster.
 This is the one place v2 spends real money — see the cost note in `PIVOT.md`
 section 4 — so it is the first number to measure.
 
+### v2 step 3 — Narrative capture and clone matching (2026-09-17)
+
+Gate passed against a **real recorded vamp wave**, kept as
+`fixtures/launches-2026-09-17.json`. 123 launches captured over four minutes at
+31/min, containing "Thursday Arena" spawning ~25 clones with the ticker mutating
+across `THURSDAY`, `THURSDAYARENA` and `CUPCAKE`.
+
+| Run | Clones found |
+|---|---|
+| Parent is a THURSDAY launch in the fixture | 24 |
+| Parent is an unrelated token | 0 |
+| Blank launches matching a blank parent | 0 of 8 |
+| URI-sharing groups caught on metadata alone | 7 of 7 |
+
+Live check separately: 23 launches onto the bus in 45 seconds, zero invalid,
+`bondingCurve` populated and ready for step 4.
+
+**The matching rule, and the data that settled it.** Best of four cross-field
+pairings rather than a weighted sum. `CUPCAKE` paired with the name
+`thursdayarena` proves the ticker can carry no signal while the name carries
+all of it, so requiring both to agree would have missed that clone entirely.
+
+**Normalisation is the load-bearing part, not the fuzzy matching.** Exact
+equality after normalisation finds 6.03 of the 6.14 mean matches that a 0.85
+Jaro-Winkler threshold finds. The threshold is almost irrelevant between 0.85
+and 1.00. Jaro-Winkler stays for a wave that renames more creatively, but it is
+not what makes this work, and tuning it is not where effort belongs.
+
+**The result is bimodal, which is the actual signal.** Half of all launches
+match nothing; a wave member matches ~25. The gap between those two states is
+wide enough that almost any threshold sits inside it.
+
+**Three bugs the data found.**
+
+- *Blank names match each other perfectly.* Eight of 123 sampled launches have
+  no usable name, and `jaro("","")` is 1.0, so a nameless token matched
+  everything. `narrative.min_length` is load-bearing, not defensive.
+- *A token matched itself.* The launch feed reports the mint you just bought, so
+  the parent appeared as the first clone of itself. The most alarming possible
+  false positive.
+- *The type contract caught two more at compile time.* Reshaping `MintEvent`
+  broke the publisher's slot cursor and the replay tool's pacing, because
+  neither can read `blockTime` off a launch. Both now go through `eventTime()`.
+  This is exactly what section 6 of the old spec was for.
+
+**Permissive on purpose.** Step 5's roster signal is the strict gate, so a false
+positive here costs one wasted bonding curve subscription and a false negative
+is a missed vamp. Tuned toward recall.
+
+**A liveness inversion.** The wallet watcher must never treat silence as death,
+because a quiet wallet means lunch. The launch feed at 31/min is the opposite,
+so it does get the `SilenceWatchdog` the wallet watcher deliberately refuses.
+Same module, opposite conclusion, both correct.
+
+### v2 step 2 — Watches (2026-09-17)
+
+Gate passed against the operator's own real fills, re-timed to the present so
+the expiry path was reachable. Five events in, every branch exercised:
+
+| Counter | Value |
+|---|---|
+| received | 5 |
+| opened | 2 |
+| closedBySell | 1 |
+| closedByExpiry | 1 |
+| sellsWithoutWatch | 1 |
+| addedToExisting | 1 |
+| open at exit | 0 |
+
+Three decisions inside it are worth knowing.
+
+**A second buy does not restart the clock.** Vamp risk is measured from the
+parent's deployment, which the first buy already anchors. A top-up does not make
+the token younger, so `addedToExisting` counts it and nothing else happens.
+
+**Any sell closes the watch, including a partial one.** This follows the
+operator's statement that they close out in full. It is the expensive direction
+if scaling out ever becomes normal, so it is marked at the line that would have
+to change.
+
+**`sweep` takes the clock as an argument rather than reading one.** Live, wall
+clock is correct: "three minutes since I bought" is elapsed real time. Under
+replay it has to be event time, or a session at 600x would expire every watch
+before its vamps arrived. That is the same trap the cooldown fell into at step 6,
+and the signature is the only thing preventing a repeat.
+
+Also added: counters print on shutdown as well as on the heartbeat. The first
+test run ended before the 60-second heartbeat and reported nothing at all.
+
+### Watches are timers, not positions (2026-09-17)
+
+I worked up a design where on-chain token balances were the source of truth for
+whether a position was open, on the grounds that accumulating from fills drifts
+the moment a fill is missed — and this session had already lost one to the
+commitment bug. The operator's wallet even showed all three cases live: an
+account closed cleanly, an account left open at zero, and USDC dust.
+
+The operator cut it: positions are always closed out, and anything held beyond
+an hour is monitored with other tools. So there is no durable position to get
+right. A watch is a timer opened by a buy and closed by a sell or by the window
+expiring, held in memory, with a restart simply dropping it.
+
+That removes balance reads, token account subscriptions, restart reconciliation
+and the dust threshold. The failure it exposes us to is a missed sell leaving a
+watch open until it times out, which costs an alert about a token already sold.
+That is the cheap direction, and the window bounds it.
+
+Worth remembering as a pattern: I was designing for durability the use case
+never asked for. The scenario is sixty seconds long; almost nothing needs to
+survive a restart.
+
 ### Repository decision
 
 Overhaul in place rather than starting fresh. The balance-delta decoder, the
@@ -462,16 +573,71 @@ watcher correctly emitted nothing and it looked like a bug. Another had a 100%
 landing rate but simply did not trade during the window. This is the same 88%
 chain-wide failure rate from the v1 notes, concentrated.
 
-### What is verified, and what is not
+### Gate passed, 2026-09-17
 
-Verified: the subscription delivers (≈250 notifications in 50s against an active
-wallet), fetch survives throttling and version 1, and decoding plus the
-trader filter reproduce **4 of 4** of the operator's real fills with correct
-side, size, mint and venue. Two buys and two sells, across both the bonding
-curve and PumpSwap.
+A live round trip on `BPPA1dyEUig6BAZHnUsHoo3u3WCtFw63ddHbmgGkdij4`:
 
-Not yet verified: a single live run where a notification becomes a printed fill.
-That needs a real buy, and it is exactly what the step 1 gate asks for.
+| Event | Block time | Printed | Slot |
+|---|---|---|---|
+| BUY 0.0317 SOL | 17:02:10 | 17:02:11 | 447847039 |
+| SELL 0.0215 SOL | 17:02:41 | 17:02:42 | 447847138 |
+
+`argus:cursor:wallet` finished at 447847138, matching the sell's slot on chain,
+so both fills reached the bus as well as the console.
+
+**Roughly one second from block time to printed fill.** Two samples, and block
+time has one-second resolution, so read it as "about a second" rather than a
+measurement. It is the right order of magnitude for a risk window of sixty
+seconds, and worth instrumenting properly once there is something to tune.
+
+### The bug that ate the first real fill
+
+The operator ran the watcher, made a round trip, and the heartbeat read:
+
+    notifications: 1   fills: 0   queueDepth: 1
+    rpcErrors: 0       skips: {}  lastSeenAt: null
+
+One notification in, nothing out, and not one counter to explain it. Both of
+their transactions decode correctly offline, so the loss was in the watcher.
+
+**Cause: a commitment mismatch.** `logsSubscribe` fires at `confirmed`.
+`getTransaction` defaults to `finalized`, which trails by roughly thirteen
+seconds. The transaction you were just told about is therefore not yet
+queryable, the call returns null, and the fill is gone. Verified directly by
+catching a just-confirmed signature off the wire and asking for it both ways in
+the same instant:
+
+    commitment = default (finalized)  ->  NULL
+    commitment = confirmed            ->  found
+
+Using `finalized` would also add ~13s of latency to a tool whose entire risk
+window is about sixty seconds, so matching the subscription is right on both
+counts.
+
+**What made it invisible was mine.** `handleSignature` did
+`if (raw === null) return;` with no counter, so a dropped fill produced perfect
+silence rather than a number going up. Nulls are now retried, then counted as
+`notFound` and logged. The lesson is narrower than "log more": an early return
+on an unexpected value is a silent failure unless it increments something.
+
+**A third, smaller bug in the same heartbeat.** `queueDepth` was written only on
+push, never after shift, so it read 1 forever and looked like a stuck queue.
+It was stale, not stuck — but it sent me looking in the wrong place first.
+
+### Subscriptions are now confirmed, not assumed
+
+A rejected `logsSubscribe` and a wallet that simply is not trading are the same
+observable: an open socket delivering nothing. The watcher now requires the
+confirmation, fails the connection if none arrives within ten seconds, and logs
+the subscription id, so an idle console still proves the watch is attached.
+
+### Quiet wallets are the norm, and that is hard to test against
+
+Four separate live runs against wallets that had landed a trade minutes earlier
+saw zero notifications. Polling the chain in parallel during two of them showed
+zero new transactions in the same window, so the watcher was right every time.
+Traders work in bursts. Any future live test needs the concurrent poll, or a
+quiet wallet will be misread as a broken subscription.
 
 ### Redis is optional here
 
