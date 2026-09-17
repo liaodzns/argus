@@ -6,6 +6,12 @@
 # know what ran. That offline loop is worth more than any amount of live
 # guessing.
 
+watch:
+  # How long after your buy to keep looking for clones of it. Vamps land within
+  # about a minute of the parent's deployment, so this is short by nature; the
+  # margin is here because closing early is the expensive direction.
+  window_seconds: 180
+
 windows:
   # All windows are in seconds and measured on block time, not wall clock.
   short: 60

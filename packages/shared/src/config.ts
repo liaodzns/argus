@@ -134,6 +134,10 @@ const Seconds = z.number().int().positive();
 const Fraction = z.number().min(0).max(1);
 
 export const ThresholdsSchema = z.object({
+  watch: z.object({
+    /** How long after a buy to keep matching new mints against it. */
+    window_seconds: Seconds,
+  }),
   windows: z.object({
     short: Seconds,
     medium: Seconds,
