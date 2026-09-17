@@ -78,9 +78,9 @@ async function record(path: string): Promise<void> {
   mkdirSync(dirname(path), { recursive: true });
   const out = createWriteStream(path, { flags: "a" });
   const sub = new Redis(env.REDIS_URL, { maxRetriesPerRequest: null });
-  const counts = { trade: 0, mint: 0, migration: 0, malformed: 0 };
+  const counts = { trade: 0, mint: 0, migration: 0, activity: 0, malformed: 0 };
 
-  await sub.subscribe(CHANNELS.trades, CHANNELS.mints, CHANNELS.migrations);
+  await sub.subscribe(CHANNELS.trades, CHANNELS.mints, CHANNELS.migrations, CHANNELS.activity);
   sub.on("message", (_channel: string, payload: string) => {
     let json: unknown;
     try {
