@@ -10,7 +10,7 @@
  * That decision deletes balance reads, token account subscriptions, restart
  * reconciliation and a dust threshold. See NOTES.md.
  */
-import type { Address, Timestamp, TradeEvent } from "@argus/shared";
+import type { Address, Timestamp, TokenMeta, TradeEvent } from "@argus/shared";
 
 export interface Watch {
   mint: Address;
@@ -19,6 +19,12 @@ export interface Watch {
   openedBy: string;
   entrySolLamports: number;
   expiresAt: Timestamp;
+  /**
+   * What this token is, for matching clones against. Null until enrichment
+   * resolves it, which is why matching has to tolerate a watch with no
+   * narrative yet rather than assuming one is always present.
+   */
+  meta: TokenMeta | null;
 }
 
 export type WatchCloseReason = "sold" | "expired";
@@ -66,6 +72,14 @@ export function createWatches(options: WatchesOptions) {
       return [...watches.values()];
     },
 
+    /** Attach the narrative once enrichment has resolved it. */
+    describe(mint: string, meta: TokenMeta): boolean {
+      const watch = watches.get(mint);
+      if (watch === undefined) return false;
+      watch.meta = meta;
+      return true;
+    },
+
     observe(trade: TradeEvent): void {
       if (trade.side === "buy") {
         const existing = watches.get(trade.mint);
@@ -82,6 +96,7 @@ export function createWatches(options: WatchesOptions) {
           openedBy: trade.signature,
           entrySolLamports: trade.solLamports,
           expiresAt: trade.blockTime + options.windowMs(),
+          meta: null,
         };
         watches.set(trade.mint, watch);
         stats.opened += 1;
