@@ -30,11 +30,15 @@ import { runWithReconnect } from "./reconnect.js";
  */
 const MAX_TX_VERSION = 1;
 
+/** Request id for the one subscription this watcher makes. */
+const SUBSCRIBE_ID = 1;
+
 export interface WalletWatcherStats {
   notifications: number;
   fills: number;
   duplicates: number;
   queueDepth: number;
+  notFound: number;
   rpcErrors: number;
   skips: Partial<Record<SkipReason, number>>;
   lastSeenAt: number | null;
@@ -53,6 +57,8 @@ export interface WalletWatcherOptions {
   /** Concurrent getTransaction calls. One wallet rarely needs more than a few,
    *  but a burst must not turn into a burst of requests. */
   concurrency?: number;
+  /** How long to wait for the server to confirm the subscription. */
+  subscribeTimeoutMs?: number;
 }
 
 export function createWalletWatcher(options: WalletWatcherOptions) {
@@ -60,9 +66,11 @@ export function createWalletWatcher(options: WalletWatcherOptions) {
   const pingIntervalMs = options.pingIntervalMs ?? 30_000;
   const pongTimeoutMs = options.pongTimeoutMs ?? 10_000;
   const concurrency = options.concurrency ?? 4;
+  const subscribeTimeoutMs = options.subscribeTimeoutMs ?? 10_000;
 
   const stats: WalletWatcherStats = {
-    notifications: 0, fills: 0, duplicates: 0, queueDepth: 0, rpcErrors: 0, skips: {}, lastSeenAt: null,
+    notifications: 0, fills: 0, duplicates: 0, queueDepth: 0, notFound: 0,
+    rpcErrors: 0, skips: {}, lastSeenAt: null,
   };
 
   // One wallet does not generate enough signatures to need eviction, but the
@@ -127,6 +135,7 @@ export function createWalletWatcher(options: WalletWatcherOptions) {
     while (active < concurrency) {
       const signature = queue.shift();
       if (signature === undefined) return;
+      stats.queueDepth = queue.length;
       active += 1;
       void handleSignature(signature).finally(() => {
         active -= 1;
@@ -135,10 +144,30 @@ export function createWalletWatcher(options: WalletWatcherOptions) {
     }
   }
 
+  /**
+   * Even at matching commitment a signature can briefly not resolve while it
+   * propagates, so a null is retried before being believed — and then counted.
+   * The first version of this returned early on null with no counter at all,
+   * which turned a dropped fill into perfect silence: one notification in, zero
+   * fills out, zero errors, zero skips, nothing to chase.
+   */
+  async function fetchWithRetry(signature: string): Promise<unknown> {
+    for (let round = 0; round < 4; round++) {
+      const raw = await fetchTransaction(signature);
+      if (raw !== null && raw !== undefined) return raw;
+      await new Promise((r) => setTimeout(r, 500 * (round + 1)));
+    }
+    return null;
+  }
+
   async function handleSignature(signature: string): Promise<void> {
     try {
-      const raw = await fetchTransaction(signature);
-      if (raw === null || raw === undefined) return;
+      const raw = await fetchWithRetry(signature);
+      if (raw === null || raw === undefined) {
+        stats.notFound += 1;
+        logger.warn({ signature }, "transaction never resolved; fill not recorded");
+        return;
+      }
       const tx = RpcTransactionSchema.parse(raw);
       const { trades, skipped } = decodeSwaps(tx);
       if (skipped !== null) {
@@ -171,6 +200,7 @@ export function createWalletWatcher(options: WalletWatcherOptions) {
         settled = true;
         if (pingTimer !== undefined) clearInterval(pingTimer);
         if (pongTimer !== undefined) clearTimeout(pongTimer);
+        if (subscribeTimer !== undefined) clearTimeout(subscribeTimer);
         ws.removeAllListeners();
         // terminate, not close: a socket that has stopped answering may never
         // complete a closing handshake, and waiting for one is how you hang.
@@ -181,11 +211,22 @@ export function createWalletWatcher(options: WalletWatcherOptions) {
 
       signal.addEventListener("abort", () => finish(), { once: true });
 
+      // A rejected subscription is indistinguishable from a wallet that simply
+      // is not trading: both are an open socket delivering nothing, forever.
+      // That is the exact failure this project refuses to have, so the
+      // confirmation is required and its absence is fatal to the connection.
+      let subscribed = false;
+      let subscribeTimer: ReturnType<typeof setTimeout> | undefined;
+
       ws.on("open", () => {
         ws.send(JSON.stringify({
-          jsonrpc: "2.0", id: 1, method: "logsSubscribe",
+          jsonrpc: "2.0", id: SUBSCRIBE_ID, method: "logsSubscribe",
           params: [{ mentions: [wallet] }, { commitment: "confirmed" }],
         }));
+        subscribeTimer = setTimeout(() => {
+          if (!subscribed) finish(new Error(`no subscription confirmation in ${subscribeTimeoutMs}ms`));
+        }, subscribeTimeoutMs);
+        subscribeTimer.unref();
         pingTimer = setInterval(() => {
           if (pongTimer !== undefined) return; // one in flight is enough
           pongTimer = setTimeout(() => {
@@ -195,7 +236,6 @@ export function createWalletWatcher(options: WalletWatcherOptions) {
           ws.ping();
         }, pingIntervalMs);
         pingTimer.unref();
-        logger.info({ wallet }, "watching wallet");
       });
 
       ws.on("pong", () => {
@@ -207,9 +247,27 @@ export function createWalletWatcher(options: WalletWatcherOptions) {
         let frame: unknown;
         try { frame = JSON.parse(data.toString()); } catch { return; }
         const message = frame as {
+          id?: number;
+          result?: unknown;
+          error?: { message: string };
           method?: string;
           params?: { result?: { value?: { signature?: string; err?: unknown } } };
         };
+        // Subscription confirmation, or its rejection.
+        if (message.id === SUBSCRIBE_ID) {
+          if (message.error !== undefined) {
+            finish(new Error(`logsSubscribe rejected: ${message.error.message}`));
+            return;
+          }
+          if (typeof message.result === "number") {
+            subscribed = true;
+            if (subscribeTimer !== undefined) clearTimeout(subscribeTimer);
+            // Logged positively so an idle console still shows the watch is
+            // genuinely attached rather than merely connected.
+            logger.info({ wallet, subscription: message.result }, "watching wallet");
+          }
+          return;
+        }
         if (message.method !== "logsNotification") return;
         const value = message.params?.result?.value;
         const signature = value?.signature;
