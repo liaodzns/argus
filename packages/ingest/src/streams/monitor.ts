@@ -1,29 +1,27 @@
 /**
- * Price and flow monitoring, keyed on the mint.
+ * Price, flow, and who is buying — all from log subscriptions.
  *
- * One `logsSubscribe { mentions: [mint] }` per monitored token. That is
- * venue-agnostic by construction: the mint never changes while the bonding
- * curve and the AMM pool do, so the same subscription follows a token across
- * bonding with no switchover logic at all.
+ * Holds two kinds of subscription on one socket:
  *
- * This replaced an attempt to read reserves out of the curve and pool accounts
- * directly. PumpSwap's pool account holds no reserves — they live in separate
- * vaults — and the curve's values did not reconcile with the creation feed's
- * own figures. Guessing at either layout yields a confident chart at the wrong
- * magnitude, which is the worst kind of wrong. See PIVOT.md.
+ *   mints    the token you hold and every clone of it, driven by a Redis set
+ *            the engine writes. Gives trade rate for free, and a rate-limited
+ *            decoded price sample.
+ *   roster   all 230 tracked wallets, permanently.
  *
- * Two tiers, because they cost very differently:
+ * Both are `mentions` filters, so a transaction touching a roster wallet *and*
+ * a monitored mint is delivered twice, once per subscription, with the same
+ * signature. Joining on that signature proves a tracked wallet traded that
+ * clone, with no `getTransaction` at all. Verified: 100% of one mint's
+ * transactions also appeared in a second subscription's stream, and 231
+ * subscriptions confirmed on a single socket.
  *
- *   Free   — every notification forwarded as MintActivity. Exact trade count
- *            and landed ratio, no RPC calls, identical on both venues.
- *   Paid   — one decoded trade per mint per `sampleIntervalMs`, giving price.
- *            Rate-limited on purpose: a hot token does ~7 landed trades a
- *            second, so decoding everything on a 25-clone wave would need
- *            hundreds of calls a second and fall behind exactly when it matters.
+ * Subscribing by mint rather than by curve or pool account is what makes
+ * pre-bond and post-bond one mechanism: a mint does not change when a token
+ * bonds. See PIVOT.md for the account layouts this replaced.
  *
- * Which mints to hold is not decided here. The engine writes a set to Redis and
- * this polls it, so the two processes need no protocol between them and either
- * can restart without a re-announce.
+ * Roster subscriptions are permanent rather than opened when a watch opens.
+ * Subscribing 230 wallets at that moment would add setup latency exactly when
+ * the risk window is sixty seconds long, and holding them costs no RPC.
  */
 import WebSocket from "ws";
 import type { Logger } from "pino";
@@ -35,9 +33,14 @@ import { runWithReconnect } from "./reconnect.js";
 const MAX_TX_VERSION = 1;
 
 export interface MonitorStats {
-  subscribed: number;
+  mintSubs: number;
+  rosterSubs: number;
   activity: number;
   landed: number;
+  rosterSeen: number;
+  /** Transactions matched across both streams. The whole point of this file. */
+  joins: number;
+  joinDecodes: number;
   samplesTaken: number;
   samplesDecoded: number;
   rpcErrors: number;
@@ -50,45 +53,63 @@ export interface MonitorOptions {
   redis: Redis;
   logger: Logger;
   onEvent: (event: StreamEvent) => void;
-  /** Minimum gap between decoded price samples for a single mint. */
+  /** Read fresh, so a hot-reloaded roster resubscribes without a restart. */
+  roster: () => readonly string[];
   sampleIntervalMs: () => number;
-  /** Most mints that may be sampled at once, chosen by observed activity. */
   maxPriced: () => number;
-  /** How often to reconcile live subscriptions against the Redis set. */
   refreshMs?: number;
+  /**
+   * How long a signature stays joinable. The two notifications for one
+   * transaction can arrive in either order and a few hundred milliseconds
+   * apart, so both sides are held briefly rather than assuming an order.
+   */
+  joinWindowMs?: number;
 }
+
+type Subject = { kind: "mint" | "roster"; address: string };
 
 export function createMonitor(options: MonitorOptions) {
   const { wsUrl, rpcUrl, redis, logger, onEvent } = options;
   const refreshMs = options.refreshMs ?? 2_000;
+  const joinWindowMs = options.joinWindowMs ?? 30_000;
 
   const stats: MonitorStats = {
-    subscribed: 0, activity: 0, landed: 0,
-    samplesTaken: 0, samplesDecoded: 0, rpcErrors: 0, subscribeFailures: 0,
+    mintSubs: 0, rosterSubs: 0, activity: 0, landed: 0, rosterSeen: 0,
+    joins: 0, joinDecodes: 0, samplesTaken: 0, samplesDecoded: 0,
+    rpcErrors: 0, subscribeFailures: 0,
   };
 
-  /** mint -> subscription id, for the mints currently held. */
-  const live = new Map<string, number>();
-  /** subscription id -> mint, to route notifications back. */
-  const bySubscription = new Map<number, string>();
-  /** mint -> when it was last decoded, for the sampling gate. */
+  /** address -> subscription id, per kind. */
+  const liveMints = new Map<string, number>();
+  const liveRoster = new Map<string, number>();
+  const bySubscription = new Map<number, Subject>();
+
   const lastSampled = new Map<string, number>();
-  /** mint -> landed notifications seen, so sampling can favour the busy. */
   const landedCount = new Map<string, number>();
 
-  let socket: WebSocket | null = null;
-  let nextRequestId = 1;
-  /** request id -> mint, so a confirmation can be tied to what asked for it. */
-  const pending = new Map<number, string>();
+  // Both halves of the join, because either can arrive first.
+  const rosterSigs = new Map<string, { wallet: string; at: number }>();
+  const mintSigs = new Map<string, { mint: string; at: number }>();
+  const joined = new Set<string>();
 
-  async function fetchTransaction(signature: string): Promise<unknown> {
+  let socket: WebSocket | null = null;
+  let nextRequestId = 0;
+  const pending = new Map<number, Subject>();
+
+  function prune(now: number): void {
+    for (const [sig, entry] of rosterSigs) if (now - entry.at > joinWindowMs) rosterSigs.delete(sig);
+    for (const [sig, entry] of mintSigs) if (now - entry.at > joinWindowMs) mintSigs.delete(sig);
+    if (joined.size > 10_000) joined.clear();
+  }
+
+  async function rpc(signature: string): Promise<unknown> {
     const body = JSON.stringify({
       jsonrpc: "2.0", id: 1, method: "getTransaction",
       params: [signature, {
         encoding: "jsonParsed",
         maxSupportedTransactionVersion: MAX_TX_VERSION,
-        // Must match the subscription's commitment. Defaulting to finalized
-        // returns null for a transaction we were just told about.
+        // Must match the subscription commitment; finalized returns null for a
+        // transaction we were just told about.
         commitment: "confirmed",
       }],
     });
@@ -109,17 +130,44 @@ export function createMonitor(options: MonitorOptions) {
     throw new Error("throttled");
   }
 
+  async function decodeInto(mint: string, signature: string, tag: "join" | "sample"): Promise<void> {
+    try {
+      const raw = await rpc(signature);
+      if (raw === null || raw === undefined) return;
+      const { trades } = decodeSwaps(RpcTransactionSchema.parse(raw));
+      for (const trade of trades) {
+        // A routed transaction carries other people's legs; only this mint's
+        // movement describes the clone.
+        if (trade.mint !== mint) continue;
+        if (tag === "join") stats.joinDecodes += 1;
+        else stats.samplesDecoded += 1;
+        onEvent(trade);
+      }
+    } catch (error) {
+      stats.rpcErrors += 1;
+      logger.debug({ mint, signature, tag, err: String(error) }, "decode failed");
+    }
+  }
+
   /**
-   * Decide whether this notification earns a decode.
+   * A tracked wallet and a monitored mint in the same transaction.
    *
-   * Sampling is capped two ways: a per-mint interval, and a ceiling on how many
-   * mints may be sampled at all. The ceiling is spent on the mints with the
-   * most observed activity rather than on the first ones seen, because during a
-   * wave the one that matters is whichever is taking volume.
+   * This is the one call worth making unconditionally. The join alone proves
+   * the wallet traded the clone but not in which direction, and a tracked
+   * wallet *exiting* a clone is not a vamp signal, so the direction has to be
+   * read off the balance deltas. Rare by construction: it needs both halves at
+   * once.
    */
+  function join(signature: string, mint: string, wallet: string): void {
+    if (joined.has(signature)) return;
+    joined.add(signature);
+    stats.joins += 1;
+    logger.info({ wallet, mint, signature }, "ROSTER TOUCHED A MONITORED MINT");
+    void decodeInto(mint, signature, "join");
+  }
+
   function shouldSample(mint: string, now: number): boolean {
-    const last = lastSampled.get(mint) ?? 0;
-    if (now - last < options.sampleIntervalMs()) return false;
+    if (now - (lastSampled.get(mint) ?? 0) < options.sampleIntervalMs()) return false;
     const busiest = [...landedCount.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, options.maxPriced())
@@ -127,59 +175,51 @@ export function createMonitor(options: MonitorOptions) {
     return busiest.includes(mint);
   }
 
-  async function sample(mint: string, signature: string): Promise<void> {
-    stats.samplesTaken += 1;
-    try {
-      const raw = await fetchTransaction(signature);
-      if (raw === null || raw === undefined) return;
-      const { trades } = decodeSwaps(RpcTransactionSchema.parse(raw));
-      for (const trade of trades) {
-        if (trade.mint !== mint) continue; // routed transactions carry other legs
-        stats.samplesDecoded += 1;
-        onEvent(trade);
-      }
-    } catch (error) {
-      stats.rpcErrors += 1;
-      logger.debug({ mint, signature, err: String(error) }, "price sample failed");
-    }
-  }
-
-  function subscribe(mint: string): void {
-    if (socket === null || socket.readyState !== 1 || live.has(mint)) return;
+  function send(subject: Subject): void {
+    if (socket === null || socket.readyState !== 1) return;
     const id = ++nextRequestId;
-    pending.set(id, mint);
+    pending.set(id, subject);
     socket.send(JSON.stringify({
       jsonrpc: "2.0", id, method: "logsSubscribe",
-      params: [{ mentions: [mint] }, { commitment: "confirmed" }],
+      params: [{ mentions: [subject.address] }, { commitment: "confirmed" }],
     }));
   }
 
-  function unsubscribe(mint: string): void {
-    const id = live.get(mint);
+  function drop(kind: "mint" | "roster", address: string): void {
+    const table = kind === "mint" ? liveMints : liveRoster;
+    const id = table.get(address);
     if (id === undefined || socket === null || socket.readyState !== 1) return;
     socket.send(JSON.stringify({
       jsonrpc: "2.0", id: ++nextRequestId, method: "logsUnsubscribe", params: [id],
     }));
-    live.delete(mint);
+    table.delete(address);
     bySubscription.delete(id);
-    landedCount.delete(mint);
-    lastSampled.delete(mint);
-    stats.subscribed = live.size;
+    if (kind === "mint") {
+      landedCount.delete(address);
+      lastSampled.delete(address);
+    }
+    stats.mintSubs = liveMints.size;
+    stats.rosterSubs = liveRoster.size;
   }
 
-  /** Reconcile what we hold against what the engine asked for. */
+  /** Reconcile both subscription sets against what they should be. */
   async function reconcile(): Promise<void> {
     if (socket === null || socket.readyState !== 1) return;
-    let wanted: string[];
+
+    const wantRoster = new Set(options.roster());
+    for (const address of wantRoster) if (!liveRoster.has(address)) send({ kind: "roster", address });
+    for (const address of [...liveRoster.keys()]) if (!wantRoster.has(address)) drop("roster", address);
+
+    let members: string[];
     try {
-      wanted = await redis.smembers(KEYS.monitored());
+      members = await redis.smembers(KEYS.monitored());
     } catch (error) {
       logger.debug({ err: String(error) }, "could not read the monitored set");
       return;
     }
-    const want = new Set(wanted);
-    for (const mint of want) if (!live.has(mint)) subscribe(mint);
-    for (const mint of [...live.keys()]) if (!want.has(mint)) unsubscribe(mint);
+    const wantMints = new Set(members);
+    for (const address of wantMints) if (!liveMints.has(address)) send({ kind: "mint", address });
+    for (const address of [...liveMints.keys()]) if (!wantMints.has(address)) drop("mint", address);
   }
 
   function connect(signal: AbortSignal): Promise<void> {
@@ -195,12 +235,14 @@ export function createMonitor(options: MonitorOptions) {
         if (timer !== undefined) clearInterval(timer);
         ws.removeAllListeners();
         ws.terminate();
-        // A reconnect must re-subscribe from scratch; ids from the dead socket
-        // mean nothing on the new one.
-        live.clear();
+        // Subscription ids belong to the dead socket; a reconnect resubscribes
+        // everything from scratch.
+        liveMints.clear();
+        liveRoster.clear();
         bySubscription.clear();
         pending.clear();
-        stats.subscribed = 0;
+        stats.mintSubs = 0;
+        stats.rosterSubs = 0;
         socket = null;
         if (error === undefined) resolve();
         else reject(error);
@@ -209,7 +251,7 @@ export function createMonitor(options: MonitorOptions) {
       signal.addEventListener("abort", () => finish(), { once: true });
 
       ws.on("open", () => {
-        logger.info("monitor socket open");
+        logger.info({ roster: options.roster().length }, "monitor socket open");
         void reconcile();
         timer = setInterval(() => void reconcile(), refreshMs);
         timer.unref();
@@ -227,50 +269,77 @@ export function createMonitor(options: MonitorOptions) {
           result?: unknown;
           error?: { message: string };
           method?: string;
-          params?: { subscription?: number; result?: { value?: { signature?: string; err?: unknown } } };
+          params?: {
+            subscription?: number;
+            result?: { value?: { signature?: string; err?: unknown } };
+          };
         };
 
         if (message.id !== undefined) {
-          const mint = pending.get(message.id);
+          const subject = pending.get(message.id);
           pending.delete(message.id);
-          if (mint === undefined) return; // an unsubscribe acknowledgement
+          if (subject === undefined) return; // unsubscribe acknowledgement
           if (message.error !== undefined || typeof message.result !== "number") {
             stats.subscribeFailures += 1;
-            logger.warn({ mint, err: message.error?.message }, "mint subscription rejected");
+            logger.warn(
+              { kind: subject.kind, address: subject.address, err: message.error?.message },
+              "subscription rejected",
+            );
             return;
           }
-          live.set(mint, message.result);
-          bySubscription.set(message.result, mint);
-          stats.subscribed = live.size;
+          (subject.kind === "mint" ? liveMints : liveRoster).set(subject.address, message.result);
+          bySubscription.set(message.result, subject);
+          stats.mintSubs = liveMints.size;
+          stats.rosterSubs = liveRoster.size;
           return;
         }
 
         if (message.method !== "logsNotification") return;
-        const subscription = message.params?.subscription;
+        const subscriptionId = message.params?.subscription;
         const value = message.params?.result?.value;
         const signature = value?.signature;
-        if (subscription === undefined || typeof signature !== "string") return;
-        const mint = bySubscription.get(subscription);
-        if (mint === undefined) return;
+        if (subscriptionId === undefined || typeof signature !== "string") return;
+        const subject = bySubscription.get(subscriptionId);
+        if (subject === undefined) return;
 
-        const landed = value?.err == null;
-        stats.activity += 1;
-        if (landed) {
-          stats.landed += 1;
-          landedCount.set(mint, (landedCount.get(mint) ?? 0) + 1);
+        const now = Date.now();
+        // Failed transactions moved nothing. They are not activity, not a join,
+        // and not worth a decode.
+        if (value?.err != null) {
+          if (subject.kind === "mint") stats.activity += 1;
+          return;
+        }
+        prune(now);
+
+        if (subject.kind === "roster") {
+          stats.rosterSeen += 1;
+          rosterSigs.set(signature, { wallet: subject.address, at: now });
+          const hit = mintSigs.get(signature);
+          if (hit !== undefined) join(signature, hit.mint, subject.address);
+          return;
         }
 
-        const observedAt = Date.now();
+        const mint = subject.address;
+        stats.activity += 1;
+        stats.landed += 1;
+        landedCount.set(mint, (landedCount.get(mint) ?? 0) + 1);
+        mintSigs.set(signature, { mint, at: now });
+
         const activity = MintActivitySchema.safeParse({
-          kind: "activity", mint, signature, landed, observedAt,
+          kind: "activity", mint, signature, landed: true, observedAt: now,
         });
         if (activity.success) onEvent(activity.data);
 
-        // Only landed transactions are worth decoding; a failed one moved
-        // nothing and would burn a sample for no price.
-        if (landed && shouldSample(mint, observedAt)) {
-          lastSampled.set(mint, observedAt);
-          void sample(mint, signature);
+        const rosterHit = rosterSigs.get(signature);
+        if (rosterHit !== undefined) {
+          join(signature, mint, rosterHit.wallet);
+          return; // already decoded; no need to spend a sample on it too
+        }
+
+        if (shouldSample(mint, now)) {
+          lastSampled.set(mint, now);
+          stats.samplesTaken += 1;
+          void decodeInto(mint, signature, "sample");
         }
       });
 
@@ -281,8 +350,7 @@ export function createMonitor(options: MonitorOptions) {
 
   return {
     stats,
-    /** Mints currently held, for logging. */
-    held: (): string[] => [...live.keys()],
+    held: (): string[] => [...liveMints.keys()],
     async start(signal: AbortSignal): Promise<void> {
       await runWithReconnect(connect, signal, {
         onRetry: (attempt, delayMs, error) =>
