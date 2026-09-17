@@ -1,32 +1,40 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ServerFrameSchema, type AlertPayload, type PanelTick } from "@argus/shared";
+import { ServerFrameSchema, type PositionState } from "@argus/shared";
 
 export type SocketStatus = "connecting" | "open" | "closed";
 
+/** How many prices to keep per mint. Enough for a sparkline, not a chart. */
+const HISTORY = 40;
+
 export interface SocketState {
   status: SocketStatus;
-  alerts: AlertPayload[];
-  /** Latest tick per mint. Panels read their own. */
-  ticks: Record<string, PanelTick>;
-  evaluated: number;
+  /** Open positions by mint. A closed one is removed rather than flagged. */
+  positions: Record<string, PositionState>;
+  /** Recent prices per mint, newest last. */
+  history: Record<string, number[]>;
+  /** Latest trade rate per mint. */
+  rates: Record<string, number>;
+  ticks: number;
 }
 
+const EMPTY: SocketState = {
+  status: "connecting",
+  positions: {},
+  history: {},
+  rates: {},
+  ticks: 0,
+};
+
 /**
- * Subscribes to the gateway and keeps the newest alert per mint.
+ * Subscribes to the gateway and keeps the panel's state.
  *
- * Frames are parsed, not trusted. The socket is the one place where a schema
- * change in another process shows up as bad data rather than a compile error,
- * so it gets checked here.
+ * Frames are parsed, not trusted. The socket is the one boundary where another
+ * process changing a schema shows up as bad data rather than a compile error.
  */
 export function useAlertSocket(url: string): SocketState {
-  const [state, setState] = useState<SocketState>({
-    status: "connecting",
-    alerts: [],
-    ticks: {},
-    evaluated: 0,
-  });
+  const [state, setState] = useState<SocketState>(EMPTY);
   const retry = useRef(0);
 
   useEffect(() => {
@@ -60,13 +68,28 @@ export function useAlertSocket(url: string): SocketState {
         if (!frame.success) return;
 
         setState((s) => {
-          if (frame.data.type === "tick") {
-            const tick = frame.data.data;
-            return { ...s, ticks: { ...s.ticks, [tick.mint]: tick }, evaluated: s.evaluated + 1 };
+          if (frame.data.type === "position") {
+            const position = frame.data.data;
+            const positions = { ...s.positions };
+            if (position.closed) {
+              // The panel goes away when the watch does. Leaving it up with a
+              // "closed" badge would mean the screen slowly fills with history.
+              delete positions[position.mint];
+            } else {
+              positions[position.mint] = position;
+            }
+            return { ...s, positions };
           }
-          const alert = frame.data.data;
-          const rest = s.alerts.filter((a) => a.mint !== alert.mint);
-          return { ...s, alerts: [alert, ...rest], evaluated: s.evaluated + 1 };
+          const tick = frame.data.data;
+          const prices = s.history[tick.mint] ?? [];
+          const next =
+            tick.priceSol === null ? prices : [...prices, tick.priceSol].slice(-HISTORY);
+          return {
+            ...s,
+            history: { ...s.history, [tick.mint]: next },
+            rates: { ...s.rates, [tick.mint]: tick.tradesPerMin },
+            ticks: s.ticks + 1,
+          };
         });
       };
     };
