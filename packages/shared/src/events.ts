@@ -229,14 +229,41 @@ export const NarrativeMatchSchema = z.enum([
 ]);
 export type NarrativeMatch = z.infer<typeof NarrativeMatchSchema>;
 
-export const NarrativeClusterSchema = z.object({
-  parentMint: AddressSchema,
-  parentSymbol: z.string(),
+/**
+ * A launch that is impersonating something you hold.
+ *
+ * Replaces v1's `NarrativeCluster`, which pointed the other way: there an alert
+ * was about a clone and named its parent. Here the alert is about your position
+ * and names its clones, because that is the direction the decision runs. A
+ * 25-clone wave is one alert with 25 of these rather than 25 alerts about
+ * tokens you do not own.
+ *
+ * `rosterBuys` is the trigger and `tradesPerMin` is the confirmation.
+ * `priceSol` is null until a sample has been decoded for this mint.
+ */
+export const CloneSchema = z.object({
+  mint: AddressSchema,
+  symbol: z.string(),
+  name: z.string(),
   similarity: z.number().min(0).max(1),
+  /** Which of your token's fields was recognisable in this one. */
   matchedOn: z.array(NarrativeMatchSchema).min(1),
+  /** Distinct tracked wallets that BOUGHT this clone. Sells do not count. */
+  rosterBuys: z.number().int().nonnegative(),
+  rosterWallets: z.array(AddressSchema),
+  /** Exact, from free activity notifications. */
+  tradesPerMin: z.number().nonnegative(),
+  priceSol: z.number().nonnegative().nullable(),
+  firstSeenAt: TimestampSchema,
 });
-export type NarrativeCluster = z.infer<typeof NarrativeClusterSchema>;
+export type Clone = z.infer<typeof CloneSchema>;
 
+/**
+ * The alert, and it is about the token you hold.
+ *
+ * `mint` and `meta` are your position, not the clone. You act on your position,
+ * so that is what the payload is keyed on; the clones are the evidence.
+ */
 export const AlertPayloadSchema = z.object({
   id: z.string().min(1),
   mint: AddressSchema,
@@ -244,8 +271,10 @@ export const AlertPayloadSchema = z.object({
   score: z.number().min(0).max(100),
   signals: z.array(SignalSchema),
   safety: SafetyFlagsSchema,
+  /** Tracked wallets that bought at least one of the clones below. */
   kols: z.array(KolWalletSchema),
-  narrativeCluster: NarrativeClusterSchema.nullable(),
+  /** Why this alert exists. Never empty: no clones means no alert. */
+  clones: z.array(CloneSchema).min(1),
   /**
    * Wall clock at emission — the one deliberate exception to the block-time
    * rule. `triggeredAt - earliestEventAt` is detection latency: how long Argus

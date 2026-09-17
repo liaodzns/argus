@@ -37,6 +37,12 @@ export interface Suspect {
   similarity: number;
   matchedOn: NarrativeMatch[];
   firstSeenAt: Timestamp;
+  /**
+   * Tracked wallets that BOUGHT this clone. A set, so the same wallet buying
+   * repeatedly counts once: the signal is how many distinct people are moving
+   * in, not how many times one of them clicked.
+   */
+  rosterBuyers: Set<string>;
 }
 
 export type WatchCloseReason = "sold" | "expired";
@@ -91,6 +97,31 @@ export function createWatches(options: WatchesOptions) {
     },
     list(): Watch[] {
       return [...watches.values()];
+    },
+
+    /**
+     * Record that a tracked wallet bought a clone.
+     *
+     * Returns the new distinct buyer count for that clone, or null if neither
+     * the watch nor the clone is known — which is the normal case, since the
+     * roster trades constantly and almost none of it touches what you hold.
+     */
+    recordRosterBuy(cloneMint: string, wallet: string): number | null {
+      for (const watch of watches.values()) {
+        const suspect = watch.suspects.get(cloneMint);
+        if (suspect === undefined) continue;
+        suspect.rosterBuyers.add(wallet);
+        return suspect.rosterBuyers.size;
+      }
+      return null;
+    },
+
+    /** The watch a clone belongs to, or null. */
+    watchForClone(cloneMint: string): Watch | null {
+      for (const watch of watches.values()) {
+        if (watch.suspects.has(cloneMint)) return watch;
+      }
+      return null;
     },
 
     /** Record a clone. Returns false if the watch has already closed. */

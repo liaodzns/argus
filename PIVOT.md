@@ -153,16 +153,32 @@ Which mints to hold is decided by the engine, which writes a set to Redis that
 ingest polls and diffs. No control channel, no re-announce protocol, and either
 process can restart without intervention.
 
-**6. Ask who is buying the suspect.** `logsSubscribe { mentions: [suspectMint] }`
-and decode each trade, matching the buyer against the roster in
-`config/kol-wallets.json`.
-*Cost: one `getTransaction` per trade on a suspect, only while a position is
-open. Bounded by the burst, not sustained — see section 4.*
+**6. Ask who is buying the clone, for free.** Subscribe to the 230 roster
+wallets permanently, alongside the clone mints. Both are `mentions` filters, so
+a transaction touching a roster wallet *and* a clone is delivered twice with the
+same signature. Joining on that signature proves a tracked wallet traded that
+clone with no `getTransaction` at all.
+
+Verified: 100% of one mint's transactions also appeared in a second
+subscription's stream, and 255 subscriptions held on a single socket with no
+failures.
+
+Only a joined signature gets decoded, because the join proves the wallet traded
+the clone but not in which direction, and a tracked wallet *exiting* a clone is
+not a vamp signal. That is rare by construction: it needs both halves at once.
+Measured over 70 seconds of live operation with 230 roster wallets and 25 clones
+monitored, 259 roster transactions produced zero joins and zero decodes.
+*Cost: proportional to danger rather than to activity.*
 
 ### The alert condition
 
 A vamp existing is not the signal; same-name collisions happen all day and
 almost all of them die within a minute.
+
+**The alert is about your position, not about the clone.** `AlertPayload` is
+keyed on the token you hold and carries its clones as evidence, because that is
+the direction the decision runs. A 25-clone wave is one alert with 25 entries
+rather than 25 alerts about tokens you do not own.
 
 **The signal is the roster buying the clone.** Those 230 wallets are the ones
 whose entries move attention, so their buys land *before* the volume those buys
@@ -265,8 +281,12 @@ way. There is nothing to gain.
   creations.
 - **Vamps land within ~60s of the parent's deployment**, so the risk window is
   the first few minutes after the buy, not the whole holding period.
-- **The roster stays.** It is the primary signal on a suspect, not a v1
-  leftover. Volume is confirmation, and its exact threshold stays deferred.
+- **The roster stays, and its buys are free.** Primary signal on a clone, via a
+  signature join across two subscription streams. Volume is confirmation as a
+  share of combined trade rate; an absolute threshold stays deferred.
+- **The alert is keyed on your position**, carrying `clones[]`.
+  `NarrativeCluster` is gone: it pointed the wrong way for v2 and had no
+  producer.
 - **No persistence and no restart recovery.** A watch is a timer, not a
   position. The operator closes out and monitors longer holds elsewhere.
 - **Monitoring keys on the mint, never on a venue account.** That is what makes
@@ -334,8 +354,9 @@ Each step keeps a verification gate. Same discipline as before.
    plus rate-limited price sampling, covering pre-bond and post-bond alike.
    *Gate:* price agrees with an independent source, and independently decoded
    buys and sells agree with each other at the same moment.
-5. **The alert.** Roster buys on a suspect, with volume as confirmation.
-   *Gate:* a recorded vamp wave fires; a quiet same-name collision does not.
+5. **The alert.** Roster buys on a clone trigger it; trade-rate share confirms.
+   *Gate:* the same recorded wave fires with roster buys and stays silent
+   without them.
 6. **The panel.** Your position against its suspects, one screen, Axiom link.
    *Gate:* you can decide in under three seconds.
 

@@ -407,6 +407,59 @@ reflects on sniper wallets and on my test design, not on the roster.
 This is the one place v2 spends real money — see the cost note in `PIVOT.md`
 section 4 — so it is the first number to measure.
 
+### v2 step 5 — The alert (2026-09-17)
+
+**Roster buys turned out to be free**, which was the open question from step 4.
+Subscribing to the 230 roster wallets *and* to the clone mints gives two
+notification streams, and a signature appearing in both proves that wallet
+traded that clone. Verified deterministically: 100% of one mint's transactions
+also appeared in a second subscription's stream. 255 subscriptions held on one
+socket, zero failures.
+
+Only a joined signature is decoded, because the join proves a wallet traded the
+clone but not in which direction, and a tracked wallet *exiting* a clone is not
+a vamp signal. Over 70 seconds of live operation with 230 roster wallets and 25
+clones monitored: **259 roster transactions, zero joins, zero decodes.** Cost is
+proportional to danger rather than to activity, which is the whole argument.
+
+### The gate is two-sided, and that is what makes it worth trusting
+
+| Case | Clones found | Alerts |
+|---|---|---|
+| Recorded wave, with roster buys | 24 | 1 |
+| Identical wave, no roster buys | 24 | 0 |
+| Roster *sells* the clones instead | 24 | 0 |
+
+The silent halves matter more than the firing one. Twenty-four same-ticker
+collisions producing nothing is what stops this from being a tool you learn to
+ignore.
+
+Cooldown verified separately: four roster buys produced one alert, one
+below-threshold notice, and two suppressions. The payload round-tripped through
+Redis and parsed, carrying score 55, the two buying wallets by label, 24 clones,
+both signals with real values, and `safety` honestly all null.
+
+### The alert points the other way from v1
+
+`AlertPayload` is now keyed on **the token you hold**, carrying `clones[]` as
+evidence. In v1 an alert was about a clone and named its parent; that is
+backwards for a tool whose only question is whether to exit your own position. A
+25-clone wave is one alert with 25 entries rather than 25 alerts about tokens
+you do not own.
+
+`NarrativeClusterSchema` was removed rather than left nullable, for the same
+reason `MintEvent` lost `slot` at step 3: a contract field with no producer
+eventually gets filled with something dishonest.
+
+### Two signals, and no invented ones
+
+`kol_cluster` is distinct roster buyers over the saturation point, and
+`vamp_of_runner` is the busiest clone's share of combined clone-plus-parent
+trade rate. Share rather than absolute, because a clone doing ten trades a
+minute matters only relative to what your token is doing. `score` stays a
+weight-normalised mean over implemented signals, so it widens without changing
+shape. Safety is still all nulls because nothing inspects it.
+
 ### v2 step 4 — Price and flow, both venues (2026-09-17)
 
 The parent is usually already migrated: three of the four tokens seen in the

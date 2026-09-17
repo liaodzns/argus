@@ -150,7 +150,11 @@ function captureAlerts(path: string): { stop: () => Promise<void> } {
           earliestEventAt: a.earliestEventAt,
           kols: a.kols.map((k) => k.address).sort(),
           signals: a.signals.map((s) => [s.name, Number(s.value.toFixed(4))]).sort(),
-          narrativeCluster: a.narrativeCluster?.parentMint ?? null,
+          // Sorted, because clone discovery order varies between replays while
+          // the decision does not.
+          clones: a.clones
+            .map((c) => [c.mint, c.rosterBuys, Number(c.similarity.toFixed(4))])
+            .sort(),
         })}\n`,
       );
     });

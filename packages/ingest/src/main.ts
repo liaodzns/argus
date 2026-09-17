@@ -11,7 +11,7 @@
 import pino from "pino";
 import { Redis } from "ioredis";
 import { ZodError } from "zod";
-import { configPaths, loadEnv, watchThresholds } from "@argus/shared/config";
+import { configPaths, loadEnv, watchKolWallets, watchThresholds } from "@argus/shared/config";
 import { createWalletWatcher } from "./streams/wallet.js";
 import { createLaunchWatcher } from "./streams/launches.js";
 import { createMonitor } from "./streams/monitor.js";
@@ -77,6 +77,24 @@ try {
   process.exit(1);
 }
 
+// The roster is what the signature join needs subscriptions for. Hot-reloaded
+// like everything else, so promoting or dropping a wallet takes effect without
+// a restart.
+let roster: ReturnType<typeof watchKolWallets>;
+try {
+  roster = watchKolWallets(paths.kolWallets, {
+    onError: (error) =>
+      logger.error({ err: String(error) }, "roster reload failed; keeping previous"),
+  });
+} catch (error) {
+  process.stderr.write(
+    `Could not load ${paths.kolWallets}\n  ${String(error)}\n` +
+      "  Copy config/kol-wallets.example.json and import your own wallets.\n",
+  );
+  process.exit(1);
+}
+roster.onChange((next) => logger.info({ wallets: next.wallets.length }, "roster reloaded"));
+
 const controller = new AbortController();
 const watcher = createWalletWatcher({
   wsUrl: env.SOLANA_WS_URL,
@@ -122,6 +140,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     logger.info({ signal }, "shutting down");
     clearInterval(heartbeat);
     thresholds.close();
+    roster.close();
     controller.abort();
     void (async () => {
       await publisher?.close();
@@ -145,12 +164,20 @@ const monitor = createMonitor({
   redis,
   logger,
   onEvent: (event) => publisher?.publish(event),
+  roster: () => roster.current.wallets.map((w) => w.address),
   sampleIntervalMs: () => thresholds.current.monitor.price_sample_ms,
   maxPriced: () => thresholds.current.monitor.max_priced,
   refreshMs: thresholds.current.monitor.set_refresh_ms,
 });
 
-logger.info({ wallet, rpc: env.SOLANA_WS_URL.split("?")[0] }, "argus ingest starting");
+logger.info(
+  {
+    wallet,
+    rpc: env.SOLANA_WS_URL.split("?")[0],
+    rosterWallets: roster.current.wallets.length,
+  },
+  "argus ingest starting",
+);
 
 // Both run until aborted. Either failing independently is the point of giving
 // them separate reconnect loops, so a dead launch feed cannot take your fills
