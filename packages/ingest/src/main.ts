@@ -1,15 +1,18 @@
 /**
  * Ingest entry point.
  *
- * Watches one wallet, decodes its fills, prints them and puts them on the bus.
- * Nothing else. The firehose that read every pump.fun trade is gone; see
- * PIVOT.md for why.
+ * Two sources, both onto the bus. The wallet watcher decodes your own fills.
+ * The launch watcher reports every new pump.fun token so the engine can match
+ * them against what you hold.
+ *
+ * The firehose that read every pump.fun trade is gone; see PIVOT.md for why.
  */
 import pino from "pino";
 import { Redis } from "ioredis";
 import { ZodError } from "zod";
 import { loadEnv } from "@argus/shared/config";
 import { createWalletWatcher } from "./streams/wallet.js";
+import { createLaunchWatcher } from "./streams/launches.js";
 import { createPublisher } from "./publish.js";
 
 function readEnv(): ReturnType<typeof loadEnv> {
@@ -83,7 +86,10 @@ const watcher = createWalletWatcher({
 // Your fills are rare, so an empty heartbeat is the normal state and not a
 // sign of trouble. It exists to show the socket is still attached.
 const heartbeat = setInterval(() => {
-  logger.info({ ...watcher.stats, publishing: publisher !== null }, "watching");
+  logger.info(
+    { wallet: watcher.stats, launches: launches.stats, publishing: publisher !== null },
+    "watching",
+  );
 }, 60_000);
 heartbeat.unref();
 
@@ -103,5 +109,17 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   });
 }
 
+const launches = createLaunchWatcher({
+  logger,
+  onEvent: (event) => {
+    publisher?.publish(event);
+    logger.debug({ mint: event.mint, symbol: event.symbol, name: event.name }, "launch");
+  },
+});
+
 logger.info({ wallet, rpc: env.SOLANA_WS_URL.split("?")[0] }, "argus ingest starting");
-await watcher.start(controller.signal);
+
+// Both run until aborted. Either failing independently is the point of giving
+// them separate reconnect loops, so a dead launch feed cannot take your fills
+// down with it.
+await Promise.all([watcher.start(controller.signal), launches.start(controller.signal)]);
