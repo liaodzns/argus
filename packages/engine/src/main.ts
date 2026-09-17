@@ -1,26 +1,36 @@
 /**
  * Engine entry point.
  *
- * Step 4 scope: your fills open watches, each watch learns what it holds, every
- * new launch is matched against the open ones, and both your token and its
- * clones are monitored for price and flow.
+ * Your fills open watches, each watch learns what it holds, every new launch is
+ * matched against the open ones, both your token and its clones are monitored
+ * for price and flow, and when tracked wallets start buying a clone it alerts.
  *
  * Matching stays deliberately permissive. Step 5's roster signal is the strict
  * gate, so a false positive here costs a free subscription while a false
  * negative is a missed vamp. Tune toward recall.
  *
- * The alert itself lands at step 5.
+ * The trigger is the roster rather than volume, because those wallets cause the
+ * volume and so their buys land first. Volume is the confirmation.
  */
 import pino from "pino";
 import { Redis } from "ioredis";
 import { ZodError } from "zod";
-import { CHANNELS, KEYS, StreamEventSchema, type MintEvent } from "@argus/shared";
-import { configPaths, loadEnv, watchThresholds } from "@argus/shared/config";
+import {
+  CHANNELS,
+  KEYS,
+  StreamEventSchema,
+  type Clone,
+  type MintEvent,
+  type TradeEvent,
+} from "@argus/shared";
+import { configPaths, loadEnv, watchKolWallets, watchThresholds } from "@argus/shared/config";
 import { createWatches } from "./watches.js";
 import { createEnricher } from "./enrich.js";
 import { matchNarrative } from "./narrative.js";
 import { createWindows } from "./windows.js";
 import { createFlow } from "./flow.js";
+import { buildRoster, type KolRoster } from "./signals/kol.js";
+import { buildAlert, claimAlertSlot } from "./alerts.js";
 
 const logger = pino({
   level: process.env["LOG_LEVEL"] ?? "info",
@@ -114,6 +124,24 @@ try {
 }
 
 const enricher = createEnricher({ redis, logger, rpcUrl: env.SOLANA_RPC_URL });
+let rosterHandle: ReturnType<typeof watchKolWallets>;
+try {
+  rosterHandle = watchKolWallets(paths.kolWallets, {
+    onError: (error) =>
+      logger.error({ err: String(error) }, "roster reload failed; keeping previous"),
+  });
+} catch (error) {
+  fail(
+    `Could not load ${paths.kolWallets}`,
+    `  ${String(error)}\n  Copy config/kol-wallets.example.json and import your own wallets.`,
+  );
+}
+let roster: KolRoster = buildRoster(rosterHandle.current.wallets);
+rosterHandle.onChange((next) => {
+  roster = buildRoster(next.wallets);
+  logger.info({ wallets: roster.size }, "roster reloaded");
+});
+
 const flow = createFlow({
   windows: createWindows({ redis }),
   windowMs: () => thresholds.current.windows.short * 1000,
@@ -162,6 +190,9 @@ const stats = {
   clonesFound: 0,
   activity: 0,
   samples: 0,
+  rosterBuys: 0,
+  alerts: 0,
+  suppressed: 0,
 };
 
 /**
@@ -190,11 +221,103 @@ async function describe(mint: string, openedAt: number): Promise<void> {
   }
 }
 
+/**
+ * A tracked wallet bought a clone. This is the trigger.
+ *
+ * Assembles the alert from what is already known rather than looking anything
+ * up: the narrative came from enrichment when the watch opened, the clones came
+ * from matching, and the rates came from flow.
+ */
+async function considerAlert(trade: TradeEvent): Promise<void> {
+  if (trade.side !== "buy") return;
+  const wallet = roster.lookup(trade.trader);
+  if (wallet === undefined) return;
+  const watch = watches.watchForClone(trade.mint);
+  if (watch === null || watch.meta === null) return;
+
+  watches.recordRosterBuy(trade.mint, trade.trader);
+  stats.rosterBuys += 1;
+
+  const buyers = new Set<string>();
+  for (const suspect of watch.suspects.values()) {
+    for (const buyer of suspect.rosterBuyers) buyers.add(buyer);
+  }
+  const minDistinct = thresholds.current.signals.kol_cluster.min_distinct;
+  if (buyers.size < minDistinct) {
+    logger.info(
+      { clone: trade.mint, wallet: wallet.label, distinct: buyers.size, need: minDistinct },
+      "roster buy on a clone, below the threshold",
+    );
+    return;
+  }
+
+  const now = Date.now();
+  const parentFlow = await flow.read(watch.mint, now);
+  const clones: Clone[] = [];
+  let busiest = 0;
+  for (const suspect of watch.suspects.values()) {
+    const reading = await flow.read(suspect.mint, now);
+    busiest = Math.max(busiest, reading.tradesPerMin);
+    clones.push({
+      mint: suspect.mint,
+      symbol: suspect.symbol,
+      name: suspect.name,
+      similarity: suspect.similarity,
+      matchedOn: suspect.matchedOn,
+      rosterBuys: suspect.rosterBuyers.size,
+      rosterWallets: [...suspect.rosterBuyers],
+      tradesPerMin: reading.tradesPerMin,
+      priceSol: reading.priceSol,
+      firstSeenAt: suspect.firstSeenAt,
+    });
+  }
+  // Share of combined rate. Zero denominator means nothing is trading at all,
+  // in which case there is no pressure to report.
+  const combined = busiest + parentFlow.tradesPerMin;
+  const flowShare = combined === 0 ? 0 : busiest / combined;
+
+  // Cooldown is keyed on your position, not on a clone, so a 25-clone wave
+  // produces one alert rather than twenty-five.
+  if (!(await claimAlertSlot(redis, watch.mint, trade.blockTime, thresholds.current.alerting.cooldown_seconds))) {
+    stats.suppressed += 1;
+    return;
+  }
+
+  const kols = [...buyers].map((a) => roster.lookup(a)).filter((w) => w !== undefined);
+  const earliest = Math.min(watch.openedAt, ...clones.map((c) => c.firstSeenAt));
+  const alert = buildAlert({
+    held: watch.meta,
+    clones: clones.sort((a, b) => b.rosterBuys - a.rosterBuys || b.tradesPerMin - a.tradesPerMin),
+    kols,
+    distinctRosterBuyers: buyers.size,
+    flowShare,
+    earliestEventAt: earliest,
+    thresholds: thresholds.current,
+  });
+  await redis.publish(CHANNELS.alerts, JSON.stringify(alert));
+  stats.alerts += 1;
+  logger.warn(
+    {
+      held: alert.meta.symbol,
+      mint: alert.mint,
+      score: Number(alert.score.toFixed(1)),
+      rosterBuyers: buyers.size,
+      wallets: kols.map((k) => k.label),
+      clones: alert.clones.length,
+      flowSharePct: Math.round(flowShare * 100),
+      latencyMs: alert.triggeredAt - alert.earliestEventAt,
+    },
+    "VAMP ALERT",
+  );
+}
+
 function matchLaunch(launch: MintEvent): void {
   const open = watches.list();
   if (open.length === 0) return;
   const config = {
     minSimilarity: thresholds.current.narrative.min_similarity,
+    minRosterBuyers: thresholds.current.signals.kol_cluster.min_distinct,
+    rosterWallets: roster.size,
     minLength: thresholds.current.narrative.min_length,
   };
   let considered = 0;
@@ -218,6 +341,7 @@ function matchLaunch(launch: MintEvent): void {
       similarity: hit.similarity,
       matchedOn: hit.matchedOn,
       firstSeenAt: launch.observedAt,
+      rosterBuyers: new Set<string>(),
     });
     if (!isNew) continue;
     stats.clonesFound += 1;
@@ -267,6 +391,9 @@ sub.on("message", (channel: string, payload: string) => {
       stats.samples += 1;
       void flow.sample(event).catch((error: unknown) =>
         logger.debug({ err: String(error) }, "sample aggregation failed"),
+      );
+      void considerAlert(event).catch((error: unknown) =>
+        logger.error({ err: String(error), mint: event.mint }, "alert evaluation failed"),
       );
     }
     return;
@@ -330,7 +457,13 @@ reporter.unref();
 
 const heartbeat = setInterval(() => {
   logger.info(
-    { ...stats, ...watches.stats, openWatches: watches.size, meta: enricher.stats },
+    {
+      ...stats,
+      ...watches.stats,
+      openWatches: watches.size,
+      rosterWallets: roster.size,
+      meta: enricher.stats,
+    },
     "engine stats",
   );
 }, 60_000);
@@ -351,6 +484,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     clearInterval(reporter);
     clearInterval(heartbeat);
     thresholds.close();
+    rosterHandle.close();
     void Promise.allSettled([sub.quit(), redis.quit()]).then(() => process.exit(0));
   });
 }
@@ -361,6 +495,8 @@ logger.info(
     wallet,
     windowSeconds: thresholds.current.watch.window_seconds,
     minSimilarity: thresholds.current.narrative.min_similarity,
+    minRosterBuyers: thresholds.current.signals.kol_cluster.min_distinct,
+    rosterWallets: roster.size,
     config: paths.thresholds,
   },
   "engine listening",

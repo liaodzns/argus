@@ -1,14 +1,12 @@
 /**
  * Alert construction.
  *
- * Step 5 has exactly one signal, so the composite is that signal. `score` is a
- * weight-normalised mean over the signals that actually exist, which with one
- * signal reduces to its own normalised value. Step 7 widens the denominator to
- * the full weight set; nothing here has to change for that, and nothing here
- * invents a number it cannot justify.
+ * The alert is about the token you hold, and the clones are the evidence.
  *
- * `safety` is all nulls because nothing has looked yet, and null means
- * unresolved rather than safe. The filter that acts on it arrives at step 7.
+ * Two signals are real: how many tracked wallets bought a clone, and how much
+ * of the combined trade rate the busiest clone has taken. `score` is a
+ * weight-normalised mean over those, so it widens without changing shape when
+ * more arrive. Nothing here invents a number it cannot justify.
  */
 import { randomUUID } from "node:crypto";
 import type { Redis } from "ioredis";
@@ -16,19 +14,23 @@ import {
   AlertPayloadSchema,
   KEYS,
   type AlertPayload,
+  type Clone,
   type KolWallet,
   type Signal,
   type Timestamp,
   type TokenMeta,
-  type TradeEvent,
 } from "@argus/shared";
 import type { Thresholds } from "@argus/shared/config";
 
 export interface AlertInput {
-  trade: TradeEvent;
-  meta: TokenMeta;
+  /** Your position. The alert is about this, not about the clones. */
+  held: TokenMeta;
+  clones: Clone[];
   kols: KolWallet[];
-  distinctKols: number;
+  /** Distinct tracked wallets that bought any clone. */
+  distinctRosterBuyers: number;
+  /** The busiest clone's share of combined clone-plus-parent trade rate. */
+  flowShare: number;
   earliestEventAt: Timestamp;
   thresholds: Thresholds;
 }
@@ -40,34 +42,46 @@ export function kolClusterValue(distinct: number, saturateAt: number): number {
 }
 
 export function buildAlert(input: AlertInput): AlertPayload {
-  const config = input.thresholds.signals.kol_cluster;
-  const value = kolClusterValue(input.distinctKols, config.saturate_at);
+  const kolConfig = input.thresholds.signals.kol_cluster;
+  const vampConfig = input.thresholds.signals.vamp_of_runner;
 
   const signals: Signal[] = [
     {
       name: "kol_cluster",
-      value,
-      weight: config.weight,
-      // Raw values live here, never in `value`.
+      value: kolClusterValue(input.distinctRosterBuyers, kolConfig.saturate_at),
+      weight: kolConfig.weight,
+      // Raw values here, never in `value`.
       detail: {
-        distinctInWindow: input.distinctKols,
-        minDistinct: config.min_distinct,
-        saturateAt: config.saturate_at,
-        windowSeconds: input.thresholds.windows.short,
+        distinctRosterBuyers: input.distinctRosterBuyers,
+        minDistinct: kolConfig.min_distinct,
+        saturateAt: kolConfig.saturate_at,
       },
+    },
+    {
+      // The confirmation half. A clone doing ten trades a minute matters only
+      // relative to what your own token is doing, so this is a share rather
+      // than an absolute. First cut; the threshold lives in config.
+      name: "vamp_of_runner",
+      value: Math.min(Math.max(input.flowShare, 0), 1),
+      weight: vampConfig.weight,
+      detail: { flowShare: Number(input.flowShare.toFixed(4)), clones: input.clones.length },
     },
   ];
 
   const totalWeight = signals.reduce((sum, s) => sum + s.weight, 0);
   const score =
-    totalWeight === 0 ? 0 : (signals.reduce((sum, s) => sum + s.value * s.weight, 0) / totalWeight) * 100;
+    totalWeight === 0
+      ? 0
+      : (signals.reduce((sum, s) => sum + s.value * s.weight, 0) / totalWeight) * 100;
 
   return AlertPayloadSchema.parse({
     id: randomUUID(),
-    mint: input.trade.mint,
-    meta: input.meta,
+    mint: input.held.mint,
+    meta: input.held,
     score,
     signals,
+    // Still all nulls: nothing inspects mint authority or holder concentration
+    // yet, and null means unresolved rather than safe.
     safety: {
       mintAuthorityLive: null,
       freezeAuthorityLive: null,
@@ -76,9 +90,9 @@ export function buildAlert(input: AlertInput): AlertPayload {
       lpBurned: null,
     },
     kols: input.kols,
-    narrativeCluster: null,
-    // Wall clock on purpose: triggeredAt minus earliestEventAt is meant to
-    // measure how long Argus took, not how long the market took.
+    clones: input.clones,
+    // Wall clock on purpose: triggeredAt minus earliestEventAt measures how
+    // long Argus took, not how long the market took.
     triggeredAt: Date.now(),
     earliestEventAt: input.earliestEventAt,
   });
