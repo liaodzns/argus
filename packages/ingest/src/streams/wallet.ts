@@ -82,7 +82,16 @@ export function createWalletWatcher(options: WalletWatcherOptions) {
   async function fetchTransaction(signature: string): Promise<unknown> {
     const body = JSON.stringify({
       jsonrpc: "2.0", id: 1, method: "getTransaction",
-      params: [signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: MAX_TX_VERSION }],
+      params: [signature, {
+        encoding: "jsonParsed",
+        maxSupportedTransactionVersion: MAX_TX_VERSION,
+        // Must match the subscription. logsSubscribe fires at confirmed, and
+        // getTransaction defaults to finalized, which is roughly 13 seconds
+        // behind — so the transaction you were just told about is not yet
+        // queryable and the call returns null. Verified against a live frame:
+        // same signature, same instant, finalized null and confirmed found.
+        commitment: "confirmed",
+      }],
     });
     for (let attempt = 0; attempt < 5; attempt++) {
       const response = await fetch(rpcUrl, {
