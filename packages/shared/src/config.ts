@@ -6,8 +6,9 @@
  * dragging Node built-ins into a browser bundle. Node services import it as
  * `@argus/shared/config`.
  */
-import { basename, dirname, resolve } from "node:path";
-import { readFileSync, watch } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { existsSync, readFileSync, watch } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { KolWalletSchema } from "./events.js";
@@ -118,8 +119,52 @@ export interface ConfigPaths {
   kolWallets: string;
 }
 
+/**
+ * Walk up from this module to the repository root.
+ *
+ * Identified by the package.json that declares workspaces, rather than by a
+ * fixed number of parent directories, so a change to the build layout does not
+ * silently move it.
+ */
+function repositoryRoot(): string | null {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let depth = 0; depth < 12; depth++) {
+    const manifest = join(dir, "package.json");
+    if (existsSync(manifest)) {
+      try {
+        const parsed = JSON.parse(readFileSync(manifest, "utf8")) as { workspaces?: unknown };
+        if (parsed.workspaces !== undefined) return dir;
+      } catch {
+        // Unreadable or malformed; keep walking rather than guessing.
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+/**
+ * Where thresholds.yml and kol-wallets.json live.
+ *
+ * A relative `ARGUS_CONFIG_DIR` resolves against the **repository root**, not
+ * the working directory. That distinction is the whole point of this function
+ * existing: `npm run dev` launches each service through `npm run dev -w`, which
+ * sets the working directory to that service's own package, so the documented
+ * default of `./config` used to resolve to `packages/ingest/config` and both
+ * ingest and the engine would exit at startup.
+ *
+ * Worse, they exited *inside* `tsx watch`, which keeps its watcher alive, so
+ * every process looked like it was running while two of them did nothing at
+ * all. An absolute path still wins, and is unaffected.
+ */
 export function configPaths(env: Pick<Env, "ARGUS_CONFIG_DIR">): ConfigPaths {
-  const dir = resolve(env.ARGUS_CONFIG_DIR);
+  const configured = env.ARGUS_CONFIG_DIR;
+  const root = repositoryRoot();
+  const dir = isAbsolute(configured)
+    ? configured
+    : resolve(root ?? process.cwd(), configured);
   return {
     dir,
     thresholds: resolve(dir, "thresholds.yml"),
