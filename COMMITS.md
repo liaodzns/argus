@@ -9,6 +9,101 @@ several defects are squashed into one commit message.
 
 ---
 
+## Change set: step 5, the alert
+
+**Branch:** `feat/v2-the-alert` · **Base:** `fc894a3` (step 4 merged)
+
+**Context.** Everything up to here observes. This decides. The trigger is the
+roster, because those 230 wallets cause the volume and so their buys land before
+it; trade-rate share is the confirmation.
+
+**The finding that shaped it:** roster buys are free. Two `mentions`
+subscriptions, one on the wallet and one on the clone mint, deliver the same
+transaction twice with the same signature. Joining on it proves who traded what
+with no `getTransaction`.
+
+| Check | Result |
+|---|---|
+| A mint's transactions found in a second stream | 7 of 7, 100% |
+| Subscriptions on one socket (230 roster + 25 clones) | 255, 0 failures |
+| 70s live: roster txs / joins / decodes | 259 / 0 / 0 |
+| Recorded wave with roster buys | 1 alert |
+| Identical wave without roster buys | 0 alerts |
+| Roster sells instead of buys | 0 alerts |
+| Four roster buys under a 300s cooldown | 1 alert, 2 suppressed |
+| Payload round-trip through Redis | parsed, 0 failures |
+
+**Diff:** 9 files, +541 / −158.
+
+---
+
+### 1. `feat(shared): point the alert at your position, not at the clone`
+
+`AlertPayload` is keyed on the token you hold and carries `clones[]` as
+evidence. In v1 an alert was about a clone and named its parent, which is
+backwards for a tool whose only question is whether to exit your own position.
+A 25-clone wave becomes one alert with 25 entries.
+
+`NarrativeClusterSchema` is removed rather than left nullable. It pointed the
+wrong way and would have had no producer, which is what got `MintEvent`
+reshaped at step 3. The replay tool's alert capture follows, sorted, because
+clone discovery order varies between replays while the decision does not.
+
+**Files.** `packages/shared/src/events.ts`, `scripts/replay.ts`.
+
+---
+
+### 2. `feat(ingest): detect roster buys by joining two subscription streams`
+
+The monitor gains a permanent subscription per roster wallet alongside its mint
+subscriptions, and joins them on signature. Both halves are held briefly in
+either direction, because the two notifications for one transaction arrive out
+of order and a few hundred milliseconds apart.
+
+Roster subscriptions are permanent rather than opened when a watch opens.
+Subscribing 230 wallets at that moment would add setup latency exactly when the
+risk window is sixty seconds long, and holding them costs no RPC.
+
+A joined signature is the one call worth making unconditionally, because the
+join alone cannot tell a buy from a sell and a tracked wallet exiting a clone is
+not a vamp signal.
+
+**Files.** `packages/ingest/src/streams/monitor.ts`,
+`packages/ingest/src/main.ts`.
+
+---
+
+### 3. `feat(engine): alert when tracked wallets buy a clone of what you hold`
+
+Watches track distinct roster buyers per clone, as a set, because the signal is
+how many distinct people are moving in rather than how often one of them
+clicked. The trigger is `signals.kol_cluster.min_distinct`, currently 2.
+
+Two signals, both real: distinct roster buyers, and the busiest clone's share of
+combined trade rate. No third signal is invented and `safety` stays all null
+because nothing inspects it.
+
+Cooldown is keyed on **your position**, not on a clone, so a wave produces one
+alert rather than one per clone. It reuses `claimAlertSlot`, which has been
+block-time based since step 6 of v1 and therefore survives replay.
+
+**Files.** `packages/engine/src/main.ts`, `packages/engine/src/alerts.ts`,
+`packages/engine/src/watches.ts`.
+
+---
+
+### 4. `docs: record step 5 and the free roster join`
+
+**Files.** `NOTES.md`, `PIVOT.md`, `COMMITS.md`.
+
+---
+
+### Suggested order
+
+1 → 2 → 3 → 4. Contract, producer, consumer, docs. Each typechecks alone.
+
+---
+
 ## Change set: step 4, price and flow
 
 **Branch:** `feat/v2-price-and-flow` · **Base:** `1410b91` (step 3 merged)
