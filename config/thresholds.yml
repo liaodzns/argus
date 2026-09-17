@@ -12,6 +12,17 @@ watch:
   # margin is here because closing early is the expensive direction.
   window_seconds: 180
 
+narrative:
+  # Similarity at or above which a new launch counts as a clone of something you
+  # hold. Measured against a real recorded wave: the value barely matters,
+  # because normalisation turns most clones into exact matches and the result is
+  # bimodal — half of all launches match nothing, a wave member matches ~25.
+  min_similarity: 0.90
+  # Shortest normalised name or ticker worth comparing. Blank names are real
+  # (8 of 123 sampled launches) and score 1.0 against each other, so without
+  # this a nameless token matches everything.
+  min_length: 3
+
 windows:
   # All windows are in seconds and measured on block time, not wall clock.
   short: 60

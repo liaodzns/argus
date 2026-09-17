@@ -103,14 +103,25 @@ the granularity does not matter.
 
 **4. Match new mints against the position, forward only.** From the moment you
 buy, every new pump.fun creation is compared against your token's narrative.
-PumpPortal's free `subscribeNewToken` feed delivers ~24 creations a minute with
-`mint`, `name`, `symbol`, `uri` and `bondingCurveKey` inline. Weighted
-Jaro-Winkler on name and symbol, perceptual hash on the image.
+PumpPortal's free `subscribeNewToken` feed delivers ~31 creations a minute with
+`mint`, `name`, `symbol`, `uri` and `bondingCurveKey` inline.
+
+The rule is the **best of four cross-field pairings**, not a weighted sum
+requiring both fields to agree: parent name against clone name, ticker against
+ticker, and both crossings. A real recorded wave settles this — one clone used
+the ticker `CUPCAKE` with the name `thursdayarena`, so the ticker carried no
+signal at all and the name carried everything. Either field alone is enough.
+
+Each pairing is normalised hard first (case, accents, emoji, punctuation,
+filler words, spacing), then scored with Jaro-Winkler whose prefix bonus suits
+the common append-something clone. Normalisation does nearly all the work:
+exact-match-after-normalisation finds 6.03 of the 6.14 mean matches a 0.85
+threshold finds. An identical metadata URI matches outright, for free.
 
 **Forward only.** Nothing is buffered and no attempt is made to catch a vamp
 that spawned before the buy landed. Carrying a rolling window of recent
 creations to cover that case costs more than the case is worth.
-*Cost: free. No key, no RPC.*
+*Cost: free. No key, no RPC, no image fetching.*
 
 **5. Watch the suspects, and your own token.** For each matched mint,
 `accountSubscribe` to its bonding curve account. Every trade against that curve
@@ -237,6 +248,13 @@ way. There is nothing to gain.
   position. The operator closes out and monitors longer holds elsewhere.
 - **The watch window is `watch.window_seconds`**, default 180. Short by nature,
   with margin because closing early is the expensive direction.
+- **Matching is `narrative.min_similarity`**, default 0.90, and
+  `narrative.min_length`, default 3. The threshold is insensitive; the length
+  guard is not optional, because blank names are real and score 1.0 against
+  each other.
+- **`MintEvent` carries `observedAt`, not `slot` or `blockTime`.** The creation
+  feed has no chain timestamp. `eventTime()` in shared is the only place that
+  decides which timestamp an event is ordered by.
 
 **Still open.**
 

@@ -25,6 +25,7 @@ import {
   AlertPayloadSchema,
   StreamEventSchema,
   channelForEvent,
+  eventTime,
   type StreamEvent,
 } from "@argus/shared";
 import { loadEnv } from "@argus/shared/config";
@@ -174,10 +175,10 @@ async function play(path: string, speed: number, alertsPath: string | undefined)
     // timestamp is what makes a replay reproduce the original run. Speed
     // changes only how long this process waits between publishes.
     if (previous !== null && speed > 0) {
-      const wait = (event.blockTime - previous) / speed;
+      const wait = (eventTime(event) - previous) / speed;
       if (wait > 0) await new Promise((resolve) => setTimeout(resolve, Math.min(wait, 30_000)));
     }
-    previous = event.blockTime;
+    previous = eventTime(event);
     await redis.publish(channelForEvent(event), JSON.stringify(event));
     published += 1;
     if (published % 1000 === 0) log(`  published ${published}`);

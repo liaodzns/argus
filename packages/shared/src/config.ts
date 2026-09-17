@@ -138,6 +138,10 @@ export const ThresholdsSchema = z.object({
     /** How long after a buy to keep matching new mints against it. */
     window_seconds: Seconds,
   }),
+  narrative: z.object({
+    min_similarity: Fraction,
+    min_length: z.number().int().min(1),
+  }),
   windows: z.object({
     short: Seconds,
     medium: Seconds,
