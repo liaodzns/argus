@@ -1,25 +1,60 @@
 /**
  * Swap decoding via token balance deltas.
  *
- * Not instruction parsing. Six consecutive pump.fun transactions sampled off
- * mainnet carried the instruction names Buy, SellV2, BuyExactQuoteInV2,
- * BuyExactSolIn and SwapV2, several of them wrapped in an aggregator Route.
- * Any decoder keyed on instruction layout would already be broken. Balance
- * deltas survive that, because they describe what actually moved.
+ * Not instruction parsing. One wallet's recent history alone produced the
+ * instruction names Buy, Sell, BuyExactIn, BuyExactQuoteIn, SellExactIn, Swap2
+ * and SwapBaseInput across six different venues. Any decoder keyed on
+ * instruction layout would already be broken. Balance deltas survive that,
+ * because they describe what actually moved.
  *
- * Three things about this stream that bite if you assume otherwise:
- * failed transactions are delivered and must be dropped, one transaction can
- * contain several swaps, and the fee payer is frequently not the trader.
+ * **Venue-agnostic on purpose.** An earlier version required a pump.fun program
+ * to be present, which silently discarded roughly half the operator's trading:
+ * Raydium AMM v4, Raydium CPMM, Meteora DLMM and Meteora DBC all went
+ * unrecorded, including launchpads like Stonkfun that are built on Raydium and
+ * therefore have no program of their own. A fill is a fill wherever it executed.
+ *
+ * Dropping that filter means the "is this a swap at all" question has to be
+ * answered from the deltas instead, which is what `looksLikeSwap` does below.
+ *
+ * Three things about this stream that bite if you assume otherwise: failed
+ * transactions are delivered and must be dropped, one transaction can contain
+ * several swaps, and the fee payer is frequently not the trader.
  */
 import { z } from "zod";
-import { PROGRAMS, TradeEventSchema, type TradeEvent, type Venue } from "@argus/shared";
+import { TradeEventSchema, type TradeEvent } from "@argus/shared";
+
+const WSOL = "So11111111111111111111111111111111111111112";
 
 /** Quote assets. A delta in one of these is the money leg, not the traded token. */
 const QUOTE_MINTS = new Set([
-  "So11111111111111111111111111111111111111112", // wrapped SOL
+  WSOL,
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
 ]);
+
+/**
+ * Programs that are never the venue: system plumbing, token programs, and the
+ * front-end router that wraps a trade without being where it executed.
+ */
+const INFRASTRUCTURE = [
+  "11111111111111111111111111111111",
+  "ComputeBudget111111111111111111111111111111",
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+  "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9", // Axiom router
+  "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ", // pump.fun fee program
+];
+
+/**
+ * Below this, a lamport movement is fees and rent rather than a trade.
+ *
+ * A fresh associated token account costs about 0.002 SOL of rent and a
+ * transaction fee is a few ten-thousandths, while the smallest real fill
+ * observed was 0.029 SOL. Without this floor an inbound token transfer reads as
+ * a buy whose price is the transaction fee.
+ */
+const MIN_TRADE_LAMPORTS = 1_000_000; // 0.001 SOL
 
 const ProgramRefSchema = z.object({ programId: z.string() });
 
@@ -64,10 +99,11 @@ export type RpcTransaction = z.infer<typeof RpcTransactionSchema>;
 export type SkipReason =
   | "failed_tx"
   | "no_block_time"
-  | "no_watched_program"
+  | "no_swap_program"
   | "no_candidate_mint"
   | "no_trader"
-  | "zero_sol";
+  | "not_a_swap"
+  | "below_floor";
 
 export interface DecodeResult {
   trades: TradeEvent[];
@@ -79,27 +115,17 @@ interface Delta {
   mint: string;
   decimals: number;
   delta: bigint;
-  accountIndex: number;
 }
 
-function programsInvoked(tx: RpcTransaction): Set<string> {
+function swapPrograms(tx: RpcTransaction): string[] {
   const ids = new Set<string>();
   for (const ix of tx.transaction.message.instructions) ids.add(ix.programId);
   for (const group of tx.meta.innerInstructions ?? []) {
     for (const ix of group.instructions) ids.add(ix.programId);
   }
-  return ids;
-}
-
-/**
- * Post-migration trades run through the AMM, pre-migration through the curve.
- * A migrating token appears on both in the same transaction; the AMM wins,
- * because that is where the liquidity now is.
- */
-function venueOf(invoked: Set<string>): Venue | null {
-  if (invoked.has(PROGRAMS.PUMP_SWAP)) return "pumpswap";
-  if (invoked.has(PROGRAMS.PUMP_FUN)) return "pumpfun_curve";
-  return null;
+  for (const known of INFRASTRUCTURE) ids.delete(known);
+  // Sysvars and other pseudo-programs occasionally appear.
+  return [...ids].filter((id) => !id.startsWith("Sysvar"));
 }
 
 function tokenDeltas(tx: RpcTransaction): Delta[] {
@@ -113,7 +139,6 @@ function tokenDeltas(tx: RpcTransaction): Delta[] {
       mint: b.mint,
       decimals: b.uiTokenAmount.decimals,
       delta: -BigInt(b.uiTokenAmount.amount),
-      accountIndex: b.accountIndex,
     });
   }
   for (const b of tx.meta.postTokenBalances ?? []) {
@@ -127,7 +152,6 @@ function tokenDeltas(tx: RpcTransaction): Delta[] {
         mint: b.mint,
         decimals: b.uiTokenAmount.decimals,
         delta: amount,
-        accountIndex: b.accountIndex,
       });
     } else {
       existing.delta += amount;
@@ -149,35 +173,65 @@ function nativeDeltaOf(tx: RpcTransaction, pubkey: string): number {
 }
 
 /**
+ * How much SOL the trader's side moved, in lamports, signed.
+ *
+ * Native lamports plus any wrapped SOL, because a routed trade may settle in
+ * either and some front-ends unwrap while others do not. The transaction fee is
+ * added back when the trader paid it, so a fill is not understated by it.
+ */
+function traderSolMovement(
+  tx: RpcTransaction,
+  trader: string,
+  deltas: readonly Delta[],
+  isFeePayer: boolean,
+): number {
+  const native = nativeDeltaOf(tx, trader) + (isFeePayer ? tx.meta.fee : 0);
+  const wrapped = deltas
+    .filter((d) => d.owner === trader && d.mint === WSOL)
+    .reduce((sum, d) => sum + Number(d.delta), 0);
+  return native + wrapped;
+}
+
+/**
+ * Does this look like a trade rather than a transfer?
+ *
+ * The venue-agnostic definition: the trader's token balance moved one way and
+ * their SOL moved the other. A transfer moves tokens with no SOL on the other
+ * side, so its only lamport movement is the fee, which the floor rejects.
+ *
+ * This is the guard that replaced requiring a known program. Without it, every
+ * inbound token transfer would be recorded as a buy priced at the fee.
+ */
+function looksLikeSwap(tokenDelta: bigint, solMovement: number): boolean {
+  if (Math.abs(solMovement) < MIN_TRADE_LAMPORTS) return false;
+  const tokensIn = tokenDelta > 0n;
+  const solOut = solMovement < 0;
+  return tokensIn === solOut;
+}
+
+/**
  * SOL moved by the swap, in lamports.
  *
  * Preferred reading is the counterparty's own lamport change: for a bonding
  * curve trade that is exactly the SOL that entered or left the curve, with no
- * transaction fee, rent for a freshly created associated token account, or
- * platform fee mixed in.
- *
- * A pool holding wrapped SOL rather than native lamports has no such change,
- * and neither does an aggregator standing between the trader and the curve, so
- * fall back to the trader's own movement with the fee added back. Measured
- * against one routed sell in the fixtures, that fallback came in about 5% light
- * because platform fees stay inside it. Fine for a volume signal, which cares
- * about the shape of the curve rather than the exact fill, and not fine for
- * anything claiming to be a fill price.
+ * transaction fee, rent, or platform fee mixed in. An AMM pool holding wrapped
+ * SOL in separate vaults has no such change, and neither does an aggregator
+ * standing between the trader and the pool, so fall back to the trader's own
+ * movement. Measured against one routed sell, that fallback came in about 5%
+ * light because platform fees stay inside it. Fine for a volume signal, not
+ * fine for anything claiming to be a fill price.
  */
 function solLamportsOf(
   tx: RpcTransaction,
   counterparty: string,
-  trader: string,
-  traderIsFeePayer: boolean,
+  traderMovement: number,
 ): number {
   const viaCounterparty = Math.abs(nativeDeltaOf(tx, counterparty));
-  if (viaCounterparty > 0) return viaCounterparty;
-  const raw = nativeDeltaOf(tx, trader);
-  return Math.abs(traderIsFeePayer ? raw + tx.meta.fee : raw);
+  return viaCounterparty > 0 ? viaCounterparty : Math.abs(traderMovement);
 }
 
 /**
- * Decode every pump.fun swap in one transaction.
+ * Decode every swap in one transaction, at any venue.
  *
  * Returns an empty trade list with a reason rather than throwing, because most
  * transactions on this stream are legitimately not trades and a throw per
@@ -186,9 +240,8 @@ function solLamportsOf(
 export function decodeSwaps(tx: RpcTransaction): DecodeResult {
   if (tx.meta.err !== null) return { trades: [], skipped: "failed_tx" };
 
-  const invoked = programsInvoked(tx);
-  const venue = venueOf(invoked);
-  if (venue === null) return { trades: [], skipped: "no_watched_program" };
+  const programs = swapPrograms(tx);
+  if (programs.length === 0) return { trades: [], skipped: "no_swap_program" };
 
   // Block time is null for very recent blocks on some endpoints. Emitting the
   // event with a wall-clock stamp would silently corrupt every rolling window
@@ -210,15 +263,30 @@ export function decodeSwaps(tx: RpcTransaction): DecodeResult {
   if (candidates.length === 0) return { trades: [], skipped: "no_candidate_mint" };
 
   const trades: TradeEvent[] = [];
+  let sawNonSwap = false;
+  let sawBelowFloor = false;
+
   for (const leg of candidates) {
-    // The other side of this mint: the curve, or the AMM pool.
+    const movement = traderSolMovement(tx, leg.owner, deltas, leg.owner === feePayer);
+    if (Math.abs(movement) < MIN_TRADE_LAMPORTS) {
+      sawBelowFloor = true;
+      continue;
+    }
+    if (!looksLikeSwap(leg.delta, movement)) {
+      sawNonSwap = true;
+      continue;
+    }
+
+    // The other side of this mint: a curve, a pool, or an aggregator.
     const counterparty = deltas.find(
       (d) => d.mint === leg.mint && d.owner !== leg.owner && d.delta * leg.delta < 0n,
     );
-    if (counterparty === undefined) continue;
 
-    const solLamports = solLamportsOf(tx, counterparty.owner, leg.owner, leg.owner === feePayer);
-    if (solLamports === 0) continue;
+    const solLamports = solLamportsOf(tx, counterparty?.owner ?? "", movement);
+    if (solLamports < MIN_TRADE_LAMPORTS) {
+      sawBelowFloor = true;
+      continue;
+    }
 
     trades.push(
       TradeEventSchema.parse({
@@ -232,11 +300,13 @@ export function decodeSwaps(tx: RpcTransaction): DecodeResult {
         solLamports,
         tokenAmount: (leg.delta < 0n ? -leg.delta : leg.delta).toString(),
         decimals: leg.decimals,
-        venue,
+        programs,
       }),
     );
   }
 
-  if (trades.length === 0) return { trades: [], skipped: "zero_sol" };
+  if (trades.length === 0) {
+    return { trades: [], skipped: sawNonSwap ? "not_a_swap" : sawBelowFloor ? "below_floor" : "no_candidate_mint" };
+  }
   return { trades, skipped: null };
 }
