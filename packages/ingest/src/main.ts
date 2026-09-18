@@ -109,7 +109,7 @@ const watcher = createWalletWatcher({
         side: event.side,
         sol: (event.solLamports / 1e9).toFixed(4),
         mint: event.mint,
-        venue: event.venue,
+        via: event.programs.map((p) => p.slice(0, 6)),
         slot: event.slot,
       },
       event.side === "buy" ? "BUY" : "SELL",
