@@ -37,9 +37,6 @@ export type Timestamp = z.infer<typeof TimestampSchema>;
 export const SlotSchema = z.number().int().nonnegative();
 export type Slot = z.infer<typeof SlotSchema>;
 
-export const VenueSchema = z.enum(["pumpfun_curve", "pumpswap"]);
-export type Venue = z.infer<typeof VenueSchema>;
-
 export const SideSchema = z.enum(["buy", "sell"]);
 export type Side = z.infer<typeof SideSchema>;
 
@@ -71,7 +68,18 @@ export const TradeEventSchema = z.object({
    * Bounded well above any real SPL mint so a decode bug fails loud.
    */
   decimals: z.number().int().min(0).max(18),
-  venue: VenueSchema,
+  /**
+   * The swap programs this transaction went through, infrastructure excluded.
+   *
+   * Replaces a two-value `venue` enum that could not describe reality. A single
+   * routed sell was observed touching Axiom's router, Raydium CPMM, Raydium AMM
+   * v4 and Meteora DLMM at once, so there was no one venue to name. Recording
+   * what was actually invoked needs no interpretation and never needs editing
+   * when a new venue appears.
+   *
+   * A plain pump.fun curve trade is just `["6EF8rre…"]`.
+   */
+  programs: z.array(AddressSchema).min(1),
 });
 export type TradeEvent = z.infer<typeof TradeEventSchema>;
 
@@ -98,8 +106,19 @@ export const MintEventSchema = z.object({
   symbol: z.string(),
   /** Off-chain metadata URI. Two launches sharing one are byte-identical. */
   uri: z.string(),
-  /** Bonding curve account, free from the feed. Step 4 subscribes to it. */
-  bondingCurve: AddressSchema,
+  /**
+   * Bonding curve account, when the launchpad has one.
+   *
+   * Null for launchpads that do not, which is not an edge case: 24% of observed
+   * launches come from bonk.fun and carry no curve. Requiring it silently
+   * rejected a quarter of the feed, so a quarter of possible clones were never
+   * matched against anything.
+   *
+   * Monitoring keys on the mint rather than on this, so nothing depends on it.
+   */
+  bondingCurve: AddressSchema.nullable(),
+  /** Which launchpad, as the feed labels it: "pump", "bonk", and others. */
+  pool: z.string(),
   observedAt: TimestampSchema,
 });
 export type MintEvent = z.infer<typeof MintEventSchema>;

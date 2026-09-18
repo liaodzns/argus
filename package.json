@@ -18,7 +18,7 @@
     "build": "tsc --build",
     "typecheck": "tsc --build --force && tsc --noEmit -p scripts/tsconfig.json",
     "replay": "tsx --env-file-if-exists=.env scripts/replay.ts",
-    "dev:db": "docker compose up -d postgres"
+    "db": "docker compose up -d postgres"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

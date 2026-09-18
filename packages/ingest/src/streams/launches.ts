@@ -2,9 +2,13 @@
  * New token launches.
  *
  * PumpPortal's free `subscribeNewToken` feed, roughly 31 launches a minute, no
- * API key. Each frame carries the mint, name, symbol, metadata uri, creator and
- * bonding curve account, which is everything narrative matching needs and
- * everything step 4 needs to start watching a suspect's price.
+ * API key. Each frame carries the mint, name, symbol, metadata uri and creator,
+ * which is everything narrative matching needs.
+ *
+ * The feed is not pump.fun only: about a quarter of launches come from bonk.fun
+ * and carry no bonding curve at all. An earlier version required one and
+ * therefore dropped them, which meant a quarter of possible clones were never
+ * compared against anything you hold.
  *
  * This is the source that was dropped at v1 step 2 for having no trades. It was
  * never bad at creations, and for creations it costs nothing at all.
@@ -94,6 +98,7 @@ export function createLaunchWatcher(options: LaunchWatcherOptions) {
           name?: unknown;
           symbol?: unknown;
           uri?: unknown;
+          pool?: unknown;
         };
         // Subscription acknowledgements and plan-gating notices arrive on the
         // same socket.
@@ -117,10 +122,12 @@ export function createLaunchWatcher(options: LaunchWatcherOptions) {
           mint: message.mint,
           signature: message.signature,
           creator: message.traderPublicKey,
-          bondingCurve: message.bondingCurveKey,
+          // Absent on launchpads without a curve, such as bonk.fun.
+          bondingCurve: message.bondingCurveKey ?? null,
           name: message.name ?? "",
           symbol: message.symbol ?? "",
           uri: message.uri ?? "",
+          pool: typeof message.pool === "string" ? message.pool : "unknown",
           // Wall clock, and the contract says so. This feed has no chain
           // timestamp; pretending otherwise would put a fabricated block time
           // into a rolling window somewhere downstream.
